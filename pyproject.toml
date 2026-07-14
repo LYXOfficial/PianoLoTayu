@@ -1,0 +1,26 @@
+[project]
+name = "pianolotayu"
+version = "0.1.0"
+description = "Convert audio files (MP3/WAV) to piano MIDI via Fourier Transform"
+readme = "README.md"
+authors = [
+    { name = "LYXOfficial", email = "lyx2010official@outlook.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "audioread>=3.1.0",
+    "librosa>=0.11.0",
+    "numpy>=2.4.6",
+    "pretty-midi>=0.2.11",
+    "scipy>=1.18.0",
+    "sounddevice>=0.5.5",
+    "soundfile>=0.14.0",
+]
+
+[project.scripts]
+pianolotayu = "pianolotayu.cli:main"
+pianolotayu-play = "pianolotayu.play_cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.28,<0.12.0"]
+build-backend = "uv_build"
