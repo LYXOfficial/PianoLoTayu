@@ -31,7 +31,6 @@ def freq_to_midi(freq: float, piano_limit: bool = True) -> int:
     midi = int(round(midi_float))
 
     if not piano_limit:
-        # Clamp to valid MIDI range 0–127, but no octave folding
         return max(0, min(127, midi))
 
     # Octave-fold into piano range
@@ -81,23 +80,17 @@ def detect_peaks_per_frame(
 
     threshold = frame_max - threshold_db
 
-    # Find local maxima indices (scipy's argrelextrema)
-    # Use comparator=np.greater_equal to catch plateau peaks
     peak_indices = argrelextrema(spectrum_db, np.greater_equal, order=min_bin_distance)[0]
-
-    # Filter by threshold
     peak_indices = peak_indices[spectrum_db[peak_indices] >= threshold]
 
     if len(peak_indices) == 0:
         return []
 
-    # Sort by amplitude (descending)
     peak_amps = spectrum_db[peak_indices]
     sort_order = np.argsort(peak_amps)[::-1]
     peak_indices = peak_indices[sort_order]
     peak_amps = peak_amps[sort_order]
 
-    # Parabolic interpolation for sub-bin accuracy
     peaks: list[tuple[float, float]] = []
     for idx, amp in zip(peak_indices, peak_amps):
         freq = _interpolate_peak_frequency(spectrum_db, freqs, idx)
@@ -114,41 +107,23 @@ def _interpolate_peak_frequency(
     freqs: np.ndarray,
     peak_idx: int,
 ) -> float:
-    """Refine the frequency of a peak using parabolic interpolation.
-
-    Uses the peak bin and its two neighbors to estimate the true
-    centre frequency with sub-bin resolution.
-
-    Args:
-        spectrum_db: Full frame spectrum in dB.
-        freqs: Frequency array.
-        peak_idx: Index of the detected peak bin.
-
-    Returns:
-        Interpolated frequency in Hz.
-    """
+    """Refine the frequency of a peak using parabolic interpolation."""
     n_bins = len(spectrum_db)
 
     if peak_idx <= 0 or peak_idx >= n_bins - 1:
-        # Can't interpolate at edges; return bin centre
         return float(freqs[peak_idx])
 
     alpha = spectrum_db[peak_idx - 1]
     beta = spectrum_db[peak_idx]
     gamma = spectrum_db[peak_idx + 1]
 
-    # Parabolic interpolation formula
     denominator = alpha - 2.0 * beta + gamma
     if abs(denominator) < 1e-12:
-        # Degenerate case: return bin centre
         return float(freqs[peak_idx])
 
     p = 0.5 * (alpha - gamma) / denominator
-
-    # Clamp offset to ±0.5 bins
     p = max(-0.5, min(0.5, p))
 
-    # Linear interpolation between adjacent bin frequencies
     if p >= 0:
         freq = freqs[peak_idx] + p * (freqs[min(peak_idx + 1, n_bins - 1)] - freqs[peak_idx])
     else:
@@ -183,7 +158,6 @@ def amplitude_to_velocity(
     if amp_db < min_db:
         return None
 
-    # Linear mapping: min_db → 1, frame_max_db → 127
     fraction = (amp_db - min_db) / dynamic_range_db
     fraction = max(0.0, min(1.0, fraction))
     velocity = int(round(1.0 + fraction * 126.0))
@@ -234,13 +208,11 @@ def analyze_frames(
         List of lists, one per frame. Each inner list contains
         (midi_note, velocity) tuples for detected notes.
     """
-    import numpy as np
-
     n_frames = D_db.shape[1]
     frame_notes: list[list[tuple[int, int]]] = []
 
-    ref_freq = 261.63  # Middle C
-    centre_freq = 523.25  # C5, centre of mid boost bell
+    ref_freq = 261.63
+    centre_freq = 523.25
 
     for t in range(n_frames):
         spectrum = D_db[:, t]
@@ -261,14 +233,12 @@ def analyze_frames(
             if vel is None:
                 continue
 
-            # ---- Frequency-dependent velocity shaping ----
+            # Frequency-dependent velocity shaping
             scale = 1.0
 
-            # High-frequency damping: reduce piercing highs
             if high_damp > 0 and freq > ref_freq:
                 scale *= (ref_freq / freq) ** high_damp
 
-            # Midrange boost: enhance vocal/piano presence
             if mid_boost > 0 and freq > 1e-6:
                 octaves_sq = (np.log2(freq / centre_freq)) ** 2
                 bell = np.exp(-octaves_sq / 0.8)
@@ -276,7 +246,6 @@ def analyze_frames(
 
             vel = int(round(vel * scale))
             vel = max(1, min(127, vel))
-            # -----------------------------------------------
 
             notes.append((midi, vel))
 
