@@ -24,8 +24,8 @@ class Ui_Form(object):
     def setupUi(self, Form):
         if not Form.objectName():
             Form.setObjectName(u"Form")
-        Form.resize(504, 503)
-        Form.setMinimumSize(QSize(0, 0))
+        Form.resize(460, 490)
+        Form.setMinimumSize(QSize(460, 490))
         self.gridLayout = QGridLayout(Form)
         self.gridLayout.setObjectName(u"gridLayout")
         self.horizontalLayout_4 = QHBoxLayout()
@@ -124,6 +124,7 @@ class Ui_Form(object):
         sizePolicy2.setVerticalStretch(0)
         sizePolicy2.setHeightForWidth(self.sampleRateBox.sizePolicy().hasHeightForWidth())
         self.sampleRateBox.setSizePolicy(sizePolicy2)
+        self.sampleRateBox.setMaximum(999999)
         self.sampleRateBox.setSingleStep(1000)
 
         self.formLayout.setWidget(0, QFormLayout.ItemRole.FieldRole, self.sampleRateBox)
@@ -137,6 +138,7 @@ class Ui_Form(object):
         self.windowFFTBox.setObjectName(u"windowFFTBox")
         sizePolicy2.setHeightForWidth(self.windowFFTBox.sizePolicy().hasHeightForWidth())
         self.windowFFTBox.setSizePolicy(sizePolicy2)
+        self.windowFFTBox.setMaximum(999999)
         self.windowFFTBox.setSingleStep(256)
 
         self.formLayout.setWidget(1, QFormLayout.ItemRole.FieldRole, self.windowFFTBox)
@@ -150,6 +152,7 @@ class Ui_Form(object):
         self.hopLengthBox.setObjectName(u"hopLengthBox")
         sizePolicy2.setHeightForWidth(self.hopLengthBox.sizePolicy().hasHeightForWidth())
         self.hopLengthBox.setSizePolicy(sizePolicy2)
+        self.hopLengthBox.setMaximum(999999)
         self.hopLengthBox.setSingleStep(32)
 
         self.formLayout.setWidget(2, QFormLayout.ItemRole.FieldRole, self.hopLengthBox)
@@ -163,6 +166,7 @@ class Ui_Form(object):
         self.thresholdBox.setObjectName(u"thresholdBox")
         sizePolicy2.setHeightForWidth(self.thresholdBox.sizePolicy().hasHeightForWidth())
         self.thresholdBox.setSizePolicy(sizePolicy2)
+        self.thresholdBox.setMaximum(999.000000000000000)
         self.thresholdBox.setSingleStep(0.500000000000000)
 
         self.formLayout.setWidget(3, QFormLayout.ItemRole.FieldRole, self.thresholdBox)
@@ -176,6 +180,7 @@ class Ui_Form(object):
         self.maxFrameNotesBox.setObjectName(u"maxFrameNotesBox")
         sizePolicy2.setHeightForWidth(self.maxFrameNotesBox.sizePolicy().hasHeightForWidth())
         self.maxFrameNotesBox.setSizePolicy(sizePolicy2)
+        self.maxFrameNotesBox.setMaximum(999)
 
         self.formLayout.setWidget(4, QFormLayout.ItemRole.FieldRole, self.maxFrameNotesBox)
 
@@ -188,6 +193,7 @@ class Ui_Form(object):
         self.minDurationBox.setObjectName(u"minDurationBox")
         sizePolicy2.setHeightForWidth(self.minDurationBox.sizePolicy().hasHeightForWidth())
         self.minDurationBox.setSizePolicy(sizePolicy2)
+        self.minDurationBox.setMaximum(999999)
 
         self.formLayout.setWidget(5, QFormLayout.ItemRole.FieldRole, self.minDurationBox)
 
@@ -200,9 +206,43 @@ class Ui_Form(object):
         self.dynamicRangeBox.setObjectName(u"dynamicRangeBox")
         sizePolicy2.setHeightForWidth(self.dynamicRangeBox.sizePolicy().hasHeightForWidth())
         self.dynamicRangeBox.setSizePolicy(sizePolicy2)
+        self.dynamicRangeBox.setMaximum(999.000000000000000)
         self.dynamicRangeBox.setSingleStep(0.500000000000000)
 
         self.formLayout.setWidget(6, QFormLayout.ItemRole.FieldRole, self.dynamicRangeBox)
+
+        self.label_12 = QLabel(Form)
+        self.label_12.setObjectName(u"label_12")
+
+        self.formLayout.setWidget(7, QFormLayout.ItemRole.LabelRole, self.label_12)
+
+        self.highDampBox = QDoubleSpinBox(Form)
+        self.highDampBox.setObjectName(u"highDampBox")
+        sizePolicy2.setHeightForWidth(self.highDampBox.sizePolicy().hasHeightForWidth())
+        self.highDampBox.setSizePolicy(sizePolicy2)
+        self.highDampBox.setMaximum(10.000000000000000)
+        self.highDampBox.setSingleStep(0.050000000000000)
+
+        self.formLayout.setWidget(7, QFormLayout.ItemRole.FieldRole, self.highDampBox)
+
+        self.label_13 = QLabel(Form)
+        self.label_13.setObjectName(u"label_13")
+
+        self.formLayout.setWidget(8, QFormLayout.ItemRole.LabelRole, self.label_13)
+
+        self.voiceBoostBox = QDoubleSpinBox(Form)
+        self.voiceBoostBox.setObjectName(u"voiceBoostBox")
+        sizePolicy2.setHeightForWidth(self.voiceBoostBox.sizePolicy().hasHeightForWidth())
+        self.voiceBoostBox.setSizePolicy(sizePolicy2)
+        self.voiceBoostBox.setMaximum(10.000000000000000)
+        self.voiceBoostBox.setSingleStep(0.050000000000000)
+
+        self.formLayout.setWidget(8, QFormLayout.ItemRole.FieldRole, self.voiceBoostBox)
+
+        self.label_10 = QLabel(Form)
+        self.label_10.setObjectName(u"label_10")
+
+        self.formLayout.setWidget(9, QFormLayout.ItemRole.LabelRole, self.label_10)
 
         self.pianoLimitSwitch = QCheckBox(Form)
         self.pianoLimitSwitch.setObjectName(u"pianoLimitSwitch")
@@ -211,40 +251,9 @@ class Ui_Form(object):
         sizePolicy3.setVerticalStretch(0)
         sizePolicy3.setHeightForWidth(self.pianoLimitSwitch.sizePolicy().hasHeightForWidth())
         self.pianoLimitSwitch.setSizePolicy(sizePolicy3)
-        self.pianoLimitSwitch.setChecked(True)
+        self.pianoLimitSwitch.setChecked(False)
 
-        self.formLayout.setWidget(7, QFormLayout.ItemRole.FieldRole, self.pianoLimitSwitch)
-
-        self.label_10 = QLabel(Form)
-        self.label_10.setObjectName(u"label_10")
-
-        self.formLayout.setWidget(7, QFormLayout.ItemRole.LabelRole, self.label_10)
-
-        self.label_12 = QLabel(Form)
-        self.label_12.setObjectName(u"label_12")
-
-        self.formLayout.setWidget(8, QFormLayout.ItemRole.LabelRole, self.label_12)
-
-        self.highDampBox = QDoubleSpinBox(Form)
-        self.highDampBox.setObjectName(u"highDampBox")
-        sizePolicy2.setHeightForWidth(self.highDampBox.sizePolicy().hasHeightForWidth())
-        self.highDampBox.setSizePolicy(sizePolicy2)
-        self.highDampBox.setSingleStep(0.050000000000000)
-
-        self.formLayout.setWidget(8, QFormLayout.ItemRole.FieldRole, self.highDampBox)
-
-        self.voiceBoostBox = QDoubleSpinBox(Form)
-        self.voiceBoostBox.setObjectName(u"voiceBoostBox")
-        sizePolicy2.setHeightForWidth(self.voiceBoostBox.sizePolicy().hasHeightForWidth())
-        self.voiceBoostBox.setSizePolicy(sizePolicy2)
-        self.voiceBoostBox.setSingleStep(0.050000000000000)
-
-        self.formLayout.setWidget(9, QFormLayout.ItemRole.FieldRole, self.voiceBoostBox)
-
-        self.label_13 = QLabel(Form)
-        self.label_13.setObjectName(u"label_13")
-
-        self.formLayout.setWidget(9, QFormLayout.ItemRole.LabelRole, self.label_13)
+        self.formLayout.setWidget(9, QFormLayout.ItemRole.FieldRole, self.pianoLimitSwitch)
 
 
         self.gridLayout_2.addLayout(self.formLayout, 1, 0, 1, 2)
@@ -262,6 +271,7 @@ class Ui_Form(object):
         Form.setWindowTitle(QCoreApplication.translate("Form", u"PianoLoTayu", None))
         self.titleLabel.setText(QCoreApplication.translate("Form", u"PianoLoTayu", None))
         self.versionLabel.setText(QCoreApplication.translate("Form", u"(version)", None))
+        self.filePathEdit.setPlaceholderText(QCoreApplication.translate("Form", u"\u8f93\u5165\u6587\u4ef6\u8def\u5f84...", None))
         self.outputLabel.setText(QCoreApplication.translate("Form", u"\u8f93\u51fa\u8def\u5f84\uff1a", None))
         self.addFileArea.setText(QCoreApplication.translate("Form", u"+", None))
         self.convertButton.setText(QCoreApplication.translate("Form", u"\u5f00\u59cb\u8f6c\u6362", None))
@@ -273,9 +283,9 @@ class Ui_Form(object):
         self.label_7.setText(QCoreApplication.translate("Form", u"\u6bcf\u5e27\u6700\u591a\u97f3\u7b26\u6570", None))
         self.label_8.setText(QCoreApplication.translate("Form", u"\u6700\u77ed\u97f3\u7b26\u65f6\u957f(ms)", None))
         self.label_9.setText(QCoreApplication.translate("Form", u"\u52a8\u6001\u8303\u56f4(dB)", None))
-        self.pianoLimitSwitch.setText("")
-        self.label_10.setText(QCoreApplication.translate("Form", u"\u94a2\u7434\u97f3\u57df\u6298\u53e0", None))
         self.label_12.setText(QCoreApplication.translate("Form", u"\u9ad8\u9891\u8870\u51cf(0~2)", None))
         self.label_13.setText(QCoreApplication.translate("Form", u"\u4eba\u58f0\u589e\u5f3a(0~2)", None))
+        self.label_10.setText(QCoreApplication.translate("Form", u"\u5173\u95ed\u94a2\u7434\u97f3\u57df\u6298\u53e0", None))
+        self.pianoLimitSwitch.setText("")
     # retranslateUi
 

@@ -97,10 +97,10 @@ def _normalise(raw: str) -> str:
 _EN = {
     # CLI description
     "cli.description": (
-        "Convert audio files (MP3/WAV) to piano MIDI via Fourier Transform."
+        "Convert audio files (MP3/WAV/FLAC/OGG/M4A) to piano MIDI via Fourier Transform."
     ),
     # Positional
-    "cli.input": "Input audio file (.mp3, .wav, .flac, etc.)",
+    "cli.input": "Input audio file (.mp3, .wav, .flac, .ogg, .m4a, etc.)",
     # Options
     "cli.output": "Output MIDI file path (default: <input_stem>.mid)",
     "cli.sr": "Sample rate for analysis in Hz (default: 22050)",
@@ -128,6 +128,7 @@ _EN = {
     # Language option
     "cli.lang": "Command Interface language: \"zh\" (Chinese) or \"en\" (English). "
                 "Default: auto-detect from system locale.",
+    "cli.version": "Show version number and exit.",
     # argparse error messages
     "error.missing_input": "the following arguments are required: input",
     "error.unrecognized": "unrecognized arguments: {args}",
@@ -148,8 +149,8 @@ _EN = {
 
 # ── 中文 ──────────────────────────────────────────────────────────────────
 _ZH = {
-    "cli.description": "基于傅里叶变换将音频文件（MP3/WAV）转换为钢琴 MIDI。",
-    "cli.input": "输入音频文件（.mp3、.wav、.flac 等）",
+    "cli.description": "基于傅里叶变换将音频文件（MP3/WAV/FLAC/OGG/M4A）转换为钢琴 MIDI。",
+    "cli.input": "输入音频文件（.mp3、.wav、.flac、.ogg、.m4a 等）",
     "cli.output": "MIDI 输出路径（默认：<输入文件名>.mid）",
     "cli.sr": "分析采样率，单位 Hz（默认：22050）",
     "cli.n-fft": "FFT 窗口大小（默认：4096，在 22.05kHz 下约 5.4 Hz 分辨率）",
@@ -173,6 +174,7 @@ _ZH = {
     "cli.help": "显示此帮助信息并退出。",
     "cli.lang": "命令行语言：\"zh\"（中文）或 \"en\"（英语）。"
                 "默认：根据系统区域自动检测。",
+    "cli.version": "显示版本号并退出。",
     "error.missing_input": "请提供输入文件",
     "error.unrecognized": "无法识别的参数：{args}",
     "error.invalid_choice": "参数 {arg}：无效选项 \"{value}\"（可选：{choices}）",

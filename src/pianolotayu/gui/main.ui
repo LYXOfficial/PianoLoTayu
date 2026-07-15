@@ -6,14 +6,14 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>504</width>
-    <height>503</height>
+    <width>460</width>
+    <height>490</height>
    </rect>
   </property>
   <property name="minimumSize">
    <size>
-    <width>0</width>
-    <height>0</height>
+    <width>460</width>
+    <height>490</height>
    </size>
   </property>
   <property name="windowTitle">
@@ -94,6 +94,9 @@
            <height>32</height>
           </size>
          </property>
+         <property name="placeholderText">
+          <string>输入文件路径...</string>
+         </property>
         </widget>
        </item>
       </layout>
@@ -158,6 +161,9 @@
            <verstretch>0</verstretch>
           </sizepolicy>
          </property>
+         <property name="maximum">
+          <number>999999</number>
+         </property>
          <property name="singleStep">
           <number>1000</number>
          </property>
@@ -177,6 +183,9 @@
            <horstretch>0</horstretch>
            <verstretch>0</verstretch>
           </sizepolicy>
+         </property>
+         <property name="maximum">
+          <number>999999</number>
          </property>
          <property name="singleStep">
           <number>256</number>
@@ -198,6 +207,9 @@
            <verstretch>0</verstretch>
           </sizepolicy>
          </property>
+         <property name="maximum">
+          <number>999999</number>
+         </property>
          <property name="singleStep">
           <number>32</number>
          </property>
@@ -217,6 +229,9 @@
            <horstretch>0</horstretch>
            <verstretch>0</verstretch>
           </sizepolicy>
+         </property>
+         <property name="maximum">
+          <double>999.000000000000000</double>
          </property>
          <property name="singleStep">
           <double>0.500000000000000</double>
@@ -238,6 +253,9 @@
            <verstretch>0</verstretch>
           </sizepolicy>
          </property>
+         <property name="maximum">
+          <number>999</number>
+         </property>
         </widget>
        </item>
        <item row="5" column="0">
@@ -254,6 +272,9 @@
            <horstretch>0</horstretch>
            <verstretch>0</verstretch>
           </sizepolicy>
+         </property>
+         <property name="maximum">
+          <number>999999</number>
          </property>
         </widget>
        </item>
@@ -272,12 +293,68 @@
            <verstretch>0</verstretch>
           </sizepolicy>
          </property>
+         <property name="maximum">
+          <double>999.000000000000000</double>
+         </property>
          <property name="singleStep">
           <double>0.500000000000000</double>
          </property>
         </widget>
        </item>
+       <item row="7" column="0">
+        <widget class="QLabel" name="label_12">
+         <property name="text">
+          <string>高频衰减(0~2)</string>
+         </property>
+        </widget>
+       </item>
        <item row="7" column="1">
+        <widget class="QDoubleSpinBox" name="highDampBox">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
+          </sizepolicy>
+         </property>
+         <property name="maximum">
+          <double>10.000000000000000</double>
+         </property>
+         <property name="singleStep">
+          <double>0.050000000000000</double>
+         </property>
+        </widget>
+       </item>
+       <item row="8" column="0">
+        <widget class="QLabel" name="label_13">
+         <property name="text">
+          <string>人声增强(0~2)</string>
+         </property>
+        </widget>
+       </item>
+       <item row="8" column="1">
+        <widget class="QDoubleSpinBox" name="voiceBoostBox">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
+          </sizepolicy>
+         </property>
+         <property name="maximum">
+          <double>10.000000000000000</double>
+         </property>
+         <property name="singleStep">
+          <double>0.050000000000000</double>
+         </property>
+        </widget>
+       </item>
+       <item row="9" column="0">
+        <widget class="QLabel" name="label_10">
+         <property name="text">
+          <string>关闭钢琴音域折叠</string>
+         </property>
+        </widget>
+       </item>
+       <item row="9" column="1">
         <widget class="QCheckBox" name="pianoLimitSwitch">
          <property name="sizePolicy">
           <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
@@ -289,54 +366,7 @@
           <string/>
          </property>
          <property name="checked">
-          <bool>true</bool>
-         </property>
-        </widget>
-       </item>
-       <item row="7" column="0">
-        <widget class="QLabel" name="label_10">
-         <property name="text">
-          <string>钢琴音域折叠</string>
-         </property>
-        </widget>
-       </item>
-       <item row="8" column="0">
-        <widget class="QLabel" name="label_12">
-         <property name="text">
-          <string>高频衰减(0~2)</string>
-         </property>
-        </widget>
-       </item>
-       <item row="8" column="1">
-        <widget class="QDoubleSpinBox" name="highDampBox">
-         <property name="sizePolicy">
-          <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
-           <horstretch>0</horstretch>
-           <verstretch>0</verstretch>
-          </sizepolicy>
-         </property>
-         <property name="singleStep">
-          <double>0.050000000000000</double>
-         </property>
-        </widget>
-       </item>
-       <item row="9" column="1">
-        <widget class="QDoubleSpinBox" name="voiceBoostBox">
-         <property name="sizePolicy">
-          <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
-           <horstretch>0</horstretch>
-           <verstretch>0</verstretch>
-          </sizepolicy>
-         </property>
-         <property name="singleStep">
-          <double>0.050000000000000</double>
-         </property>
-        </widget>
-       </item>
-       <item row="9" column="0">
-        <widget class="QLabel" name="label_13">
-         <property name="text">
-          <string>人声增强(0~2)</string>
+          <bool>false</bool>
          </property>
         </widget>
        </item>

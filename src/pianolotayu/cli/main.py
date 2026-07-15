@@ -4,6 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from ..config import DEFAULTS, VERSION
 from ..convert.audio import load_audio, compute_stft
 from ..convert.analysis import analyze_frames
 from ..convert.midi_writer import create_midi, save_midi
@@ -71,6 +72,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"pianolotayu {VERSION}",
+        help=get("cli.version"),
+    )
+
+    parser.add_argument(
         "input",
         type=str,
         help=get("cli.input"),
@@ -94,49 +102,49 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sr",
         type=int,
-        default=22050,
+        default=DEFAULTS["sr"],
         help=get("cli.sr"),
     )
 
     parser.add_argument(
         "--n-fft",
         type=int,
-        default=4096,
+        default=DEFAULTS["n_fft"],
         help=get("cli.n-fft"),
     )
 
     parser.add_argument(
         "--hop-length",
         type=int,
-        default=256,
+        default=DEFAULTS["hop_length"],
         help=get("cli.hop-length"),
     )
 
     parser.add_argument(
         "--threshold",
         type=float,
-        default=20.0,
+        default=DEFAULTS["threshold"],
         help=get("cli.threshold"),
     )
 
     parser.add_argument(
         "--max-notes",
         type=int,
-        default=16,
+        default=DEFAULTS["max_notes"],
         help=get("cli.max-notes"),
     )
 
     parser.add_argument(
         "--min-duration",
         type=float,
-        default=30.0,
+        default=DEFAULTS["min_duration"],
         help=get("cli.min-duration"),
     )
 
     parser.add_argument(
         "--dynamic-range",
         type=float,
-        default=60.0,
+        default=DEFAULTS["dynamic_range"],
         help=get("cli.dynamic-range"),
     )
 
@@ -149,14 +157,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--high-damp",
         type=float,
-        default=0,
+        default=DEFAULTS["high_damp"],
         help=get("cli.high-damp"),
     )
 
     parser.add_argument(
         "--mid-boost",
         type=float,
-        default=0,
+        default=DEFAULTS["mid_boost"],
         help=get("cli.mid-boost"),
     )
 
