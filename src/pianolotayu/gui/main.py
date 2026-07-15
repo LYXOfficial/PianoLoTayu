@@ -27,21 +27,8 @@ if not _QPA_PLATFORMTHEME and os.environ.get("XDG_CURRENT_DESKTOP", "").lower() 
 
 from PySide6 import QtWidgets, QtGui, QtCore
 from .ui_main import Ui_Form
-
-
-# ── Stylesheet fragments ─────────────────────────────────────────────────
-_DROP_AREA_STYLE = """
-QPushButton#addFileArea {
-    background: transparent;
-    border: 2px dashed #999;
-    border-radius: 8px;
-}
-QPushButton#addFileArea:hover,
-QPushButton#addFileArea:drag-hover {
-    background: rgba(128, 128, 128, 0.12);
-    border-color: #666;
-}
-"""
+from .drop_label import DropLabel
+from ..config import DEFAULTS, VERSION
 
 
 _HINT_TEXT = (
@@ -53,50 +40,62 @@ _HINT_TEXT = (
 )
 
 
-class DropAreaButton(QtWidgets.QPushButton):
-    """A transparent drop-target button with dashed border."""
+# ── Widget swap helper ────────────────────────────────────────────────────
 
-    drag_hover = QtCore.Signal(bool)
+def _swap_widget(old: QtWidgets.QWidget, new: QtWidgets.QWidget) -> None:
+    new.setSizePolicy(old.sizePolicy())
+    new.setMinimumSize(old.minimumSize())
+    new.setGeometry(old.geometry())
+    top = old.window()
+    layout = _find_containing_layout(top, old)
+    if layout is not None:
+        idx = layout.indexOf(old)
+        if idx >= 0:
+            layout.insertWidget(idx, new)
+    old.hide()
+    old.deleteLater()
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAcceptDrops(True)
-        self._hover = False
 
-    # ── Drag & drop (visual only for now) ──────────────────────────────
-    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-            self._set_drag_hover(True)
+def _find_containing_layout(
+    root: QtWidgets.QWidget, target: QtWidgets.QWidget,
+) -> QtWidgets.QLayout | None:
+    top_layout = root.layout()
+    if top_layout is None:
+        return None
+    return _search_layout(top_layout, target)
 
-    def dragMoveEvent(self, event: QtGui.QDragMoveEvent) -> None:
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
 
-    def dragLeaveEvent(self, event: QtGui.QDragLeaveEvent) -> None:
-        self._set_drag_hover(False)
+def _search_layout(
+    layout: QtWidgets.QLayout, target: QtWidgets.QWidget,
+) -> QtWidgets.QLayout | None:
+    if layout.indexOf(target) >= 0:
+        return layout
+    for i in range(layout.count()):
+        item = layout.itemAt(i)
+        if item is None:
+            continue
+        child = item.layout()
+        if child is not None:
+            found = _search_layout(child, target)
+            if found is not None:
+                return found
+    return None
 
-    def dropEvent(self, event: QtGui.QDropEvent) -> None:
-        self._set_drag_hover(False)
-        # TODO: business logic — collect file paths from event.mimeData().urls()
 
-    def enterEvent(self, event: QtCore.QEvent) -> None:
-        self._hover = True
-        self._update_style()
+# ── Configuration → widget binding ────────────────────────────────────────
 
-    def leaveEvent(self, event: QtCore.QEvent) -> None:
-        self._hover = False
-        self._update_style()
-
-    # ── helpers ────────────────────────────────────────────────────────
-    def _set_drag_hover(self, on: bool) -> None:
-        self.setProperty("drag-hover", on)
-        self.style().unpolish(self)
-        self.style().polish(self)
-
-    def _update_style(self) -> None:
-        self.style().unpolish(self)
-        self.style().polish(self)
+_WIDGET_CONFIG_MAP = {
+    "sr": "sampleRateBox",
+    "n_fft": "windowFFTBox",
+    "hop_length": "hopLengthBox",
+    "threshold": "thresholdBox",
+    "max_notes": "maxFrameNotesBox",
+    "min_duration": "minDurationBox",
+    "dynamic_range": "dynamicRangeBox",
+    "high_damp": "highDampBox",
+    "mid_boost": "voiceBoostBox",
+    "no_piano_limit": "pianoLimitSwitch",
+}
 
 
 class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
@@ -104,37 +103,56 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
         super().__init__(parent)
         self.setupUi(self)
         self.retranslateUi(self)
-        self._post_init()
+        self._init_drop_area()
+        self._bind_defaults()
 
-    def _post_init(self) -> None:
-        # Replace the Designer-created addFileArea with our custom drop-target
-        old_btn = self.addFileArea
-        layout = old_btn.parentWidget().layout()
-        # Find the index of the old button in its layout
-        idx = layout.indexOf(old_btn) if layout else -1
-
-        self.drop_area = DropAreaButton(self)
+    def _init_drop_area(self) -> None:
+        old = self.addFileArea
+        self.drop_area = DropLabel(hint=_HINT_TEXT, parent=self)
         self.drop_area.setObjectName("addFileArea")
-        self.drop_area.setSizePolicy(old_btn.sizePolicy())
-        self.drop_area.setMinimumSize(old_btn.minimumSize())
-        self.drop_area.setText(_HINT_TEXT)
+        _swap_widget(old, self.drop_area)
 
-        if layout and idx >= 0:
-            layout.insertWidget(idx, self.drop_area)
+    def _bind_defaults(self) -> None:
+        # Version label
+        self.versionLabel.setText(
+            f'<span style="color: #999;">{VERSION}</span>'
+        )
+        self.versionLabel.setTextFormat(QtCore.Qt.TextFormat.RichText)
 
-        old_btn.hide()
-        old_btn.deleteLater()
+        for key, widget_name in _WIDGET_CONFIG_MAP.items():
+            widget = getattr(self, widget_name, None)
+            if widget is None:
+                continue
+            val = DEFAULTS[key]
+            if isinstance(val, bool):
+                widget.setChecked(val)
+            elif isinstance(val, float):
+                widget.setValue(float(val))
+            else:
+                widget.setValue(int(val))
+
+    def collect_config(self) -> dict:
+        cfg = {}
+        for key, widget_name in _WIDGET_CONFIG_MAP.items():
+            widget = getattr(self, widget_name, None)
+            if widget is None:
+                continue
+            val = widget.value()
+            if isinstance(val, float) and key in (
+                "sr", "n_fft", "hop_length", "max_notes", "min_duration",
+            ):
+                val = int(val)
+            cfg[key] = val
+        return cfg
 
 
 def main() -> int:
     app = QtWidgets.QApplication()
 
-    # System sans-serif override — stylesheet beats hard-coded Designer fonts.
     sys_font = QtGui.QFontDatabase.systemFont(
         QtGui.QFontDatabase.SystemFont.GeneralFont
     )
     app.setFont(sys_font)
-    app.setStyleSheet(_DROP_AREA_STYLE)
 
     window = PianoLoTayu()
     window.show()
