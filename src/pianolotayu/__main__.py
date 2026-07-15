@@ -1,6 +1,6 @@
 """Entry point for `python -m pianolotayu`."""
 
-from .cli import main
+from .cli.main import main
 import sys
 
 if __name__ == "__main__":

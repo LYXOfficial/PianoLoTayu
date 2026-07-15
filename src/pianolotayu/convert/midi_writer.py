@@ -35,7 +35,7 @@ def create_midi(
     """
     pm = pretty_midi.PrettyMIDI(initial_tempo=120.0)
     instrument = pretty_midi.Instrument(
-        program=0,  # Acoustic Grand Piano
+        program=0,
         is_drum=False,
         name="PianoLoTayu",
     )
@@ -45,8 +45,6 @@ def create_midi(
         pm.instruments.append(instrument)
         return pm
 
-    # Track active notes and their absence counters
-    # active_notes[midi] = (start_time, velocity, absent_count)
     active_notes: dict[int, tuple[float, int, int]] = {}
     min_duration_s = min_duration_ms / 1000.0
 
@@ -54,30 +52,24 @@ def create_midi(
         current_time = _frame_to_time(t, hop_length, sr)
         current_midi_set = {note[0] for note in frame_notes[t]}
 
-        # Build a dict of current velocities (take max if duplicate)
         current_velocities: dict[int, int] = {}
         for midi, vel in frame_notes[t]:
             if midi not in current_velocities or vel > current_velocities[midi]:
                 current_velocities[midi] = vel
 
-        # Check existing active notes: are they still present?
         ended_notes: list[int] = []
         for midi in list(active_notes.keys()):
             start_time, velocity, absent_count = active_notes[midi]
             if midi in current_midi_set:
-                # Still active — reset absence counter
-                # Update velocity if current is louder
                 new_vel = current_velocities.get(midi, velocity)
                 active_notes[midi] = (start_time, max(velocity, new_vel), 0)
             else:
-                # Absent this frame
                 absent_count += 1
                 if absent_count >= hysteresis_frames:
                     ended_notes.append(midi)
                 else:
                     active_notes[midi] = (start_time, velocity, absent_count)
 
-        # End notes that have been absent long enough
         for midi in ended_notes:
             start_time, velocity, _ = active_notes.pop(midi)
             duration = current_time - start_time
@@ -90,13 +82,11 @@ def create_midi(
                 )
                 instrument.notes.append(note)
 
-        # Start new notes
         for midi in current_midi_set:
             if midi not in active_notes:
                 velocity = current_velocities[midi]
                 active_notes[midi] = (current_time, velocity, 0)
 
-    # End all remaining active notes at the last frame
     end_time = _frame_to_time(n_frames, hop_length, sr)
     for midi, (start_time, velocity, _) in active_notes.items():
         duration = end_time - start_time

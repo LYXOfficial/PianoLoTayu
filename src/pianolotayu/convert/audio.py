@@ -46,7 +46,6 @@ def compute_stft(
     """
     D = librosa.stft(signal, n_fft=n_fft, hop_length=hop_length, window=window)
     mag = np.abs(D)
-    # Convert to dB, referenced to the global maximum
     D_db = librosa.amplitude_to_db(mag, ref=np.max)
 
     freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
