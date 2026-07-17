@@ -272,7 +272,7 @@ class Ui_Form(object):
         self.titleLabel.setText(QCoreApplication.translate("Form", u"PianoLoTayu", None))
         self.versionLabel.setText(QCoreApplication.translate("Form", u"(version)", None))
         self.filePathEdit.setPlaceholderText(QCoreApplication.translate("Form", u"\u8f93\u5165\u6587\u4ef6\u8def\u5f84...", None))
-        self.outputLabel.setText(QCoreApplication.translate("Form", u"\u8f93\u51fa\u8def\u5f84\uff1a", None))
+        self.outputLabel.setText(QCoreApplication.translate("Form", u"\u8f93\u51fa\u8def\u5f84\uff1a\uff08\u8bf7\u6253\u5f00\u6587\u4ef6\uff09", None))
         self.addFileArea.setText(QCoreApplication.translate("Form", u"+", None))
         self.convertButton.setText(QCoreApplication.translate("Form", u"\u5f00\u59cb\u8f6c\u6362", None))
         self.previewButton.setText(QCoreApplication.translate("Form", u"\u9884\u89c8", None))

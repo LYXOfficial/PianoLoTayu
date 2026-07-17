@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6 import QtWidgets, QtGui, QtCore
 
 
@@ -22,8 +24,10 @@ class DropLabel(QtWidgets.QLabel):
         PRESS = 3
 
     _ALPHAS = {State.IDLE: 0.0, State.HOVER: 0.05, State.DRAG: 0.14, State.PRESS: 0.14}
+    SUPPORTED_SUFFIXES = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
 
     clicked = QtCore.Signal()
+    files_dropped = QtCore.Signal(list)  # list[str] of file paths
 
     def __init__(
         self,
@@ -110,20 +114,28 @@ class DropLabel(QtWidgets.QLabel):
     # ── Events ─────────────────────────────────────────────────────────
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-            self._set_state(self.State.DRAG)
+            paths = _urls_to_paths(event.mimeData().urls())
+            if any(_has_supported_suffix(p) for p in paths):
+                event.acceptProposedAction()
+                self._set_state(self.State.DRAG)
 
     def dragMoveEvent(self, event: QtGui.QDragMoveEvent) -> None:
         if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+            paths = _urls_to_paths(event.mimeData().urls())
+            if any(_has_supported_suffix(p) for p in paths):
+                event.acceptProposedAction()
 
     def dragLeaveEvent(self, _event: QtGui.QDragLeaveEvent) -> None:
         self._set_state(self.State.IDLE)
         if self.rect().contains(self.mapFromGlobal(QtGui.QCursor.pos())):
             self._set_state(self.State.HOVER)
 
-    def dropEvent(self, _event: QtGui.QDropEvent) -> None:
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
         self._set_state(self.State.IDLE)
+        paths = [p for p in _urls_to_paths(event.mimeData().urls())
+                 if _has_supported_suffix(p)]
+        if paths:
+            self.files_dropped.emit(paths)
 
     def enterEvent(self, _event: QtCore.QEvent) -> None:
         if self._state not in (self.State.DRAG, self.State.PRESS):
@@ -151,3 +163,15 @@ class DropLabel(QtWidgets.QLabel):
             if self.rect().contains(_event.pos())
             else self.State.IDLE
         )
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def _urls_to_paths(urls: list[QtCore.QUrl]) -> list[str]:
+    """Convert a list of QUrl objects to local file paths."""
+    return [u.toLocalFile() for u in urls if u.isLocalFile()]
+
+
+def _has_supported_suffix(path: str) -> bool:
+    """Check if *path* ends with one of the supported audio suffixes."""
+    return Path(path).suffix.lower() in DropLabel.SUPPORTED_SUFFIXES
