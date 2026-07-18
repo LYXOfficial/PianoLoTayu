@@ -24,7 +24,7 @@ class DropLabel(QtWidgets.QLabel):
         PRESS = 3
 
     _ALPHAS = {State.IDLE: 0.0, State.HOVER: 0.05, State.DRAG: 0.14, State.PRESS: 0.14}
-    SUPPORTED_SUFFIXES = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
+    SUPPORTED_SUFFIXES = {".wav", ".flac", ".mp3", ".ogg", ".m4a", ".mid", ".midi"}
 
     clicked = QtCore.Signal()
     files_dropped = QtCore.Signal(list)  # list[str] of file paths
