@@ -28,6 +28,7 @@ if not _QPA_PLATFORMTHEME and os.environ.get("XDG_CURRENT_DESKTOP", "").lower() 
 from PySide6 import QtWidgets, QtGui, QtCore
 from .ui_main import Ui_Form
 from .drop_label import DropLabel
+from .win32_utils import TaskbarProgress, BeepSuppressor
 from ..config import DEFAULTS, VERSION
 from ..convert.audio import load_audio, compute_stft
 from ..convert.analysis import analyze_frames
@@ -54,7 +55,9 @@ _HINT_TEXT = (
     '<span style="font-size:10pt; color: #888;">'
     "拖拽文件至此处或点击打开文件</span><br>"
     '<span style="font-size:9pt; color: #aaa;">'
-    "支持格式：wav, flac, mp3, ogg, m4a</span>"
+    "支持格式：wav, flac, mp3, ogg, m4a,</span><br/>"
+    '<span style="font-size:9pt; color: #aaa;">'
+    "mid, midi（仅预览）</span>"
 )
 
 
@@ -132,8 +135,12 @@ class ConversionWorker(QtCore.QThread):
     def run(self) -> None:
         try:
             self.progress.emit(5)
+            if self.isInterruptionRequested():
+                return
             signal, sr = load_audio(self._input, sr=self._cfg["sr"])
             self.progress.emit(15)
+            if self.isInterruptionRequested():
+                return
 
             D_db, freqs, times = compute_stft(
                 signal, sr,
@@ -141,8 +148,9 @@ class ConversionWorker(QtCore.QThread):
                 hop_length=self._cfg["hop_length"],
             )
             self.progress.emit(30)
+            if self.isInterruptionRequested():
+                return
 
-            n_frames = D_db.shape[1]
             frame_notes = analyze_frames(
                 D_db, freqs, times, sr, self._cfg["hop_length"],
                 threshold_db=self._cfg["threshold"],
@@ -153,12 +161,16 @@ class ConversionWorker(QtCore.QThread):
                 mid_boost=self._cfg["mid_boost"],
             )
             self.progress.emit(75)
+            if self.isInterruptionRequested():
+                return
 
             midi = create_midi(
                 frame_notes, sr, self._cfg["hop_length"],
                 min_duration_ms=self._cfg["min_duration"],
             )
             self.progress.emit(90)
+            if self.isInterruptionRequested():
+                return
 
             save_midi(midi, self._output)
             self.progress.emit(100)
@@ -175,10 +187,22 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
         self.setupUi(self)
         self.retranslateUi(self)
         self._worker: ConversionWorker | None = None
+        self._taskbar = TaskbarProgress(self)
         self._init_drop_area()
         self._init_io()
         self._init_convert()
         self._bind_defaults()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self._worker is not None:
+            try:
+                if self._worker.isRunning():
+                    self._worker.requestInterruption()
+                    self._worker.quit()
+                    self._worker.wait(3000)
+            except RuntimeError:
+                pass  # C++ object already deleted
+        super().closeEvent(event)
 
     def _init_drop_area(self) -> None:
         old = self.addFileArea
@@ -191,7 +215,8 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
         self.drop_area.files_dropped.connect(self._on_files_selected)
 
     # ── File / output path ──────────────────────────────────────────────
-    _FILTER = "音频文件 (*.wav *.flac *.mp3 *.ogg *.m4a);;所有文件 (*)"
+    _FILTER = ("音频文件 (*.wav *.flac *.mp3 *.ogg *.m4a);;"
+               "MIDI 文件 (*.mid *.midi);;所有文件 (*)")
 
     def _init_io(self) -> None:
         """Set up read-only input field and clickable output label."""
@@ -214,9 +239,18 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
             return
         input_path = Path(paths[0])
         self.filePathEdit.setText(str(input_path))
-        # Auto-set output: same dir, .mid extension
-        candidate = input_path.with_suffix(".mid")
-        self._set_output(candidate)
+
+        if input_path.suffix.lower() in (".mid", ".midi"):
+            # MIDI file — preview only, no conversion needed
+            self._set_output(input_path)
+            self.convertButton.setEnabled(False)
+            self.previewButton.setEnabled(True)
+        else:
+            # Audio file — needs conversion
+            candidate = input_path.with_suffix(".mid")
+            self._set_output(candidate)
+            self.convertButton.setEnabled(True)
+            self.previewButton.setEnabled(False)
 
     def _set_output(self, path: Path) -> None:
         self._output_path = path
@@ -241,7 +275,21 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
     # ── Conversion ──────────────────────────────────────────────────────
     def _init_convert(self) -> None:
         self.convertButton.clicked.connect(self._start_conversion)
-        self.previewButton.setEnabled(False)  # not yet implemented
+        self.previewButton.clicked.connect(self._open_preview)
+        self.previewButton.setEnabled(False)
+
+    def _open_preview(self) -> None:
+        if self._output_path is None:
+            QtWidgets.QMessageBox.warning(self, "提示", "请先选择文件。")
+            return
+        if not self._output_path.exists():
+            QtWidgets.QMessageBox.warning(
+                self, "提示", "MIDI 文件尚未生成，请先点击「开始转换」。")
+            return
+        from .piano_roll import PianoRollWindow
+        self._preview_win = PianoRollWindow(str(self._output_path))
+        self._preview_win.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._preview_win.show()
 
     def _start_conversion(self) -> None:
         if self._output_path is None:
@@ -260,8 +308,6 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_conversion_done)
         self._worker.error.connect(self._on_conversion_error)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._worker.error.connect(self._worker.deleteLater)
 
         self.progressBar.setValue(0)
         self.convertButton.setEnabled(False)
@@ -269,10 +315,16 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
 
     def _on_progress(self, pct: int) -> None:
         self.progressBar.setValue(pct)
+        self._taskbar.show_normal(pct)
 
     def _on_conversion_done(self, output: str) -> None:
+        if self._worker is not None:
+            self._worker.wait(5000)
+            self._worker = None
         self.convertButton.setEnabled(True)
+        self.previewButton.setEnabled(True)
         self.progressBar.setValue(100)
+        self._taskbar.hide()
         self._show_success_dialog(Path(output))
 
     @staticmethod
@@ -295,8 +347,12 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
         return "转换过程中出现未知错误"
 
     def _on_conversion_error(self, msg: str) -> None:
+        if self._worker is not None:
+            self._worker.wait(5000)
+            self._worker = None
         self.convertButton.setEnabled(True)
         self.progressBar.setValue(0)
+        self._taskbar.show_error(0)
 
         friendly = self._friendly_error(msg)
 
@@ -329,6 +385,7 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
         box.setIcon(QtWidgets.QMessageBox.Icon.Information)
 
         btn_ok = box.addButton("确定", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        btn_preview = box.addButton("钢琴卷帘预览", QtWidgets.QMessageBox.ButtonRole.ActionRole)
         btn_folder = box.addButton("打开文件夹", QtWidgets.QMessageBox.ButtonRole.ActionRole)
         btn_system = box.addButton("使用系统应用打开", QtWidgets.QMessageBox.ButtonRole.ActionRole)
 
@@ -339,6 +396,8 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
             self._open_folder(path)
         elif clicked is btn_system:
             self._open_with_system(path)
+        elif clicked is btn_preview:
+            self._open_preview()
 
     # ── File openers ────────────────────────────────────────────────────
     @staticmethod
@@ -403,7 +462,20 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
 
 
 def main() -> int:
+    import signal
+
     app = QtWidgets.QApplication()
+
+    # ── Suppress Windows beep when clicking outside a modal dialog ────────
+    app.installNativeEventFilter(BeepSuppressor())
+
+    # ── Graceful shutdown on Ctrl+C ───────────────────────────────────────
+    signal.signal(signal.SIGINT, lambda sig, frame: app.quit())
+    # Timer required: Qt event loop blocks Python signal delivery;
+    # a periodic no-op timeout unblocks it so SIGINT is processed.
+    _sig_timer = QtCore.QTimer()
+    _sig_timer.start(400)
+    _sig_timer.timeout.connect(lambda: None)
 
     sys_font = QtGui.QFontDatabase.systemFont(
         QtGui.QFontDatabase.SystemFont.GeneralFont
