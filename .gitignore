@@ -10,3 +10,7 @@ wheels/
 .venv
 
 soundfonts/
+
+.claude/
+
+.vscode/
