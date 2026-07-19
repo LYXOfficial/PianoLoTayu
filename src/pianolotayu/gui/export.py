@@ -11,7 +11,10 @@ from .piano_view import (
     _note_color, _dist_y, _dist_h, load_pretty_midi, _midi_note_name,
     PlaybackOptions,
 )
-from .win32_utils import setup_fluidsynth_dll, fluidsynth_status_message
+from .win32_utils import (
+    setup_fluidsynth_dll, fluidsynth_status_message,
+    get_ffmpeg_exe, run_hidden, popen_hidden,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ffmpeg encoder availability check (cached)
@@ -29,12 +32,11 @@ def _get_available_encoders() -> set[str]:
     if _AVAILABLE_ENCODERS is not None:
         return _AVAILABLE_ENCODERS
     try:
-        import subprocess
-        from imageio_ffmpeg import get_ffmpeg_exe
+        from .win32_utils import get_ffmpeg_exe, run_hidden
         ffmpeg = get_ffmpeg_exe()
-        out = subprocess.run(
-            [ffmpeg, "-encoders"], capture_output=True, text=True,
-            timeout=10,
+        out = run_hidden(
+            [ffmpeg, "-hide_banner", "-nostdin", "-encoders"],
+            capture_output=True, text=True, timeout=10,
         ).stdout
         _AVAILABLE_ENCODERS = set()
         for line in out.splitlines():
@@ -196,12 +198,11 @@ def _get_available_audio_encoders() -> set[str]:
     if _AVAILABLE_AUDIO_ENCODERS is not None:
         return _AVAILABLE_AUDIO_ENCODERS
     try:
-        import subprocess
-        from imageio_ffmpeg import get_ffmpeg_exe
+        from .win32_utils import get_ffmpeg_exe, run_hidden
         ffmpeg = get_ffmpeg_exe()
-        out = subprocess.run(
-            [ffmpeg, "-encoders"], capture_output=True, text=True,
-            timeout=10,
+        out = run_hidden(
+            [ffmpeg, "-hide_banner", "-nostdin", "-encoders"],
+            capture_output=True, text=True, timeout=10,
         ).stdout
         found: set[str] = set()
         for line in out.splitlines():
@@ -220,18 +221,18 @@ def _get_available_audio_encoders() -> set[str]:
 def _video_encoder_params(codec: str, fps: int = 30) -> list[str]:
     """Speed-oriented ffmpeg flags per encoder + regular keyframes for seeking.
 
-    imageio-ffmpeg usually ships only ``libaom-av1`` for AV1.  libaom's default
-    is near cpu-used=1 (extremely slow); we force realtime/high-speed presets
-    so piano-roll exports finish in a reasonable time.
+    Piano-roll frames are full of 1-px grid / key lines.  We draw those as
+    solid integer pixels (export base image), so we can run AV1 fairly fast
+    without ``usage=realtime`` (that mode still shreds edges at 480p).
 
     Keyframe interval is ~1 s so MKV/WebM scrubbing does not decode long GOPs.
     """
     gop = max(1, int(fps) if fps and fps > 0 else 30)
     if codec == "libaom-av1":
-        # cpu-used: 0=slowest/best … 8=fastest; realtime usage skips heavy tools
+        # cpu-used 7: near the top of the speed range (0–8) without realtime.
+        # 2x2 tiles + row-mt for multi-core; still no usage=realtime.
         return [
-            "-cpu-used", "8",
-            "-usage", "realtime",
+            "-cpu-used", "7",
             "-row-mt", "1",
             "-tiles", "2x2",
             "-threads", "0",
@@ -239,19 +240,19 @@ def _video_encoder_params(codec: str, fps: int = 30) -> list[str]:
             "-keyint_min", str(gop),
         ]
     if codec == "libsvtav1":
-        # preset 0=slowest … 12/13=fastest; keyint in frames via svtav1-params
+        # preset 10: fast; integer-pixel key lines survive better than before
         return [
             "-preset", "10",
             "-svtav1-params", f"fast-decode=1:keyint={gop}",
             "-g", str(gop),
         ]
     if codec == "librav1e":
-        return ["-speed", "10", "-g", str(gop)]
+        return ["-speed", "9", "-g", str(gop)]
     if codec == "libvpx-vp9":
-        # deadline=realtime + high cpu-used keeps VP9 usable for exports
+        # good + cpu-used 6: faster than 5, still cleaner than realtime
         return [
-            "-deadline", "realtime",
-            "-cpu-used", "8",
+            "-deadline", "good",
+            "-cpu-used", "6",
             "-row-mt", "1",
             "-tile-columns", "2",
             "-frame-parallel", "1",
@@ -296,10 +297,8 @@ def _finalize_container(
     ffmpeg: str, src: str, dst: str, *, abort=None,
 ) -> None:
     """Remux *src* → *dst* (stream copy) with seek-friendly index layout."""
-    import subprocess
-
     cmd = [
-        ffmpeg, "-y",
+        ffmpeg, "-y", "-nostdin",
         "-i", src,
         "-c", "copy",
         "-map", "0",
@@ -307,7 +306,7 @@ def _finalize_container(
         "-loglevel", "error",
         dst,
     ]
-    proc = subprocess.run(
+    proc = run_hidden(
         cmd, capture_output=True, text=True, encoding="utf-8",
         errors="replace",
     )
@@ -365,7 +364,7 @@ class VideoExportWorker(QtCore.QThread):
     def run(self) -> None:
         import os, tempfile, subprocess
         import numpy as np
-        from imageio_ffmpeg import get_ffmpeg_exe
+        from .win32_utils import get_ffmpeg_exe
         _ffmpeg = get_ffmpeg_exe()
 
         tmp_video: str | None = None
@@ -462,6 +461,7 @@ class VideoExportWorker(QtCore.QThread):
             if is_vaapi:
                 ff_cmd = [
                     _ffmpeg, "-y",
+                    # stdin is the rawvideo pipe (not console) — no -nostdin
                     "-f", "rawvideo", "-vcodec", "rawvideo",
                     "-s", f"{self._w}x{self._h}", "-pix_fmt", "rgba",
                     "-r", str(self._fps), "-i", "-",
@@ -487,7 +487,9 @@ class VideoExportWorker(QtCore.QThread):
                     *mux_layout,
                     tmp_video,
                 ]
-            ff_proc = subprocess.Popen(
+            # stdin=PIPE (raw frames) — popen_hidden keeps it, only defaults
+            # stdin when the caller omits it (avoids WinError 6 on GUI launch).
+            ff_proc = popen_hidden(
                 ff_cmd, stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             )
@@ -500,15 +502,37 @@ class VideoExportWorker(QtCore.QThread):
                 return QtGui.QColor(_note_color(pitch))
 
             # ── Pre-render static base image (keyboard + grid backgrounds) ──
+            # Integer pixel geometry, no antialiasing: AV1/VP9 + yuv420p
+            # destroy soft 1-px AA lines (especially at 480p where each key
+            # is only ~5 px tall).  Sharp fills survive compression far better.
             base_img = QtGui.QImage(self._w, self._h,
                                     QtGui.QImage.Format.Format_RGBA8888)
             base_img.fill(QtGui.QColor(25, 25, 28))
             bp = QtGui.QPainter(base_img)
-            bp.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+            bp.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+            bp.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing, True)
+
+            def _h_sep(x0: int, y: int, x1: int, color: QtGui.QColor) -> None:
+                """1-px horizontal separator as a filled rect (integer y)."""
+                yi = int(round(y))
+                if yi < 0 or yi >= self._h:
+                    return
+                bp.fillRect(x0, yi, max(1, x1 - x0), 1, color)
+
+            def _v_sep(x: int, y0: int, y1: int, color: QtGui.QColor) -> None:
+                """1-px vertical separator as a filled rect (integer x)."""
+                xi = int(round(x))
+                if xi < 0 or xi >= self._w:
+                    return
+                bp.fillRect(xi, y0, 1, max(1, y1 - y0), color)
+
+            # At very low res, skip dense separators — row/column fill contrast
+            # already shows key boundaries; 1-px lines just ring under AV1.
+            min_cell = note_h if not self._vertical else note_w_col
+            draw_seps = min_cell >= 4
 
             if self._vertical:
                 # ── Vertical mode: grid stripes + bottom keyboard bar ───
-                # Grid: vertical stripes (pitch columns)
                 for pitch in range(MIN_PITCH, MAX_PITCH + 1):
                     idx = pitch - MIN_PITCH
                     col_w = note_w_col + 1 if idx < extra_w else note_w_col
@@ -518,10 +542,10 @@ class VideoExportWorker(QtCore.QThread):
                     is_white = (pitch % 12) in _KEY_WHITE
                     c = (QtGui.QColor(38, 38, 42) if is_white
                          else QtGui.QColor(22, 22, 25))
-                    bp.fillRect(QtCore.QRectF(sx, 0, col_w, grid_h), c)
-                    bp.setPen(QtGui.QColor(45, 45, 50))
-                    bp.drawLine(QtCore.QPointF(sx + col_w, 0),
-                                QtCore.QPointF(sx + col_w, grid_h))
+                    bp.fillRect(int(sx), 0, int(col_w), int(grid_h), c)
+                    if draw_seps:
+                        _v_sep(sx + col_w - 1, 0, grid_h,
+                               QtGui.QColor(45, 45, 50))
                 # Keyboard: horizontal bar at the bottom
                 for pitch in range(MIN_PITCH, MAX_PITCH + 1):
                     idx = pitch - MIN_PITCH
@@ -531,65 +555,71 @@ class VideoExportWorker(QtCore.QThread):
                                + (idx - extra_w) * note_w_col)
                     is_white = (pitch % 12) in _KEY_WHITE
                     if is_white:
-                        bp.fillRect(QtCore.QRectF(kx, grid_h, col_w, key_h),
-                                    QtGui.QColor(245, 245, 245))
+                        bp.fillRect(int(kx), int(grid_h), int(col_w),
+                                    int(key_h), QtGui.QColor(245, 245, 245))
                     else:
-                        bp.fillRect(QtCore.QRectF(kx, grid_h, col_w, key_h),
-                                    QtGui.QColor(245, 245, 245))
-                        bh = int(key_h * 0.6)
-                        bp.fillRect(QtCore.QRectF(kx, grid_h, col_w, bh),
+                        bp.fillRect(int(kx), int(grid_h), int(col_w),
+                                    int(key_h), QtGui.QColor(245, 245, 245))
+                        bh = max(2, int(key_h * 0.6))
+                        bp.fillRect(int(kx), int(grid_h), int(col_w), bh,
                                     QtGui.QColor(25, 25, 25))
-                    bp.setPen(QtGui.QColor(180, 180, 180))
-                    bp.drawLine(QtCore.QPointF(kx + col_w, grid_h),
-                                QtCore.QPointF(kx + col_w, self._h))
+                    if draw_seps:
+                        _v_sep(kx + col_w - 1, grid_h, self._h,
+                               QtGui.QColor(160, 160, 160))
                     if pitch % 12 == 0:
                         name = _midi_note_name(pitch)
                         bp.setPen(QtGui.QColor(120, 120, 120))
                         font_sz = max(4, min(8, note_w_col // 2))
                         bp.setFont(QtGui.QFont("sans-serif", font_sz))
                         bp.drawText(
-                            QtCore.QRectF(kx, grid_h + key_h * 3 // 5, col_w,
-                                          max(4, key_h * 2 // 5 - 2)),
-                            QtCore.Qt.AlignmentFlag.AlignCenter
-                            | QtCore.Qt.TextFlag.TextSingleLine, name)
+                            QtCore.QRect(int(kx),
+                                         int(grid_h + key_h * 3 // 5),
+                                         int(col_w),
+                                         max(4, int(key_h * 2 // 5 - 2))),
+                            int(QtCore.Qt.AlignmentFlag.AlignCenter
+                                | QtCore.Qt.TextFlag.TextSingleLine),
+                            name)
             else:
                 # ── Horizontal mode: left keyboard strip + grid stripes ──
                 for pitch in range(MIN_PITCH, MAX_PITCH + 1):
                     row_h_k = _dist_h(pitch, note_h, extra)
-                    ky = _dist_y(pitch, note_h, extra)
+                    ky = int(round(_dist_y(pitch, note_h, extra)))
                     is_white = (pitch % 12) in _KEY_WHITE
                     if is_white:
-                        bp.fillRect(QtCore.QRectF(0, ky, key_w, row_h_k),
+                        bp.fillRect(0, ky, int(key_w), int(row_h_k),
                                     QtGui.QColor(245, 245, 245))
                     else:
-                        bp.fillRect(QtCore.QRectF(0, ky, key_w, row_h_k),
+                        bp.fillRect(0, ky, int(key_w), int(row_h_k),
                                     QtGui.QColor(245, 245, 245))
-                        bw = int(key_w * 0.6)
-                        bp.fillRect(QtCore.QRectF(key_w - bw, ky, bw, row_h_k),
+                        bw = max(2, int(key_w * 0.6))
+                        bp.fillRect(int(key_w) - bw, ky, bw, int(row_h_k),
                                     QtGui.QColor(25, 25, 25))
-                    bp.setPen(QtGui.QColor(180, 180, 180))
-                    bp.drawLine(QtCore.QPointF(0, ky + row_h_k),
-                                QtCore.QPointF(key_w, ky + row_h_k))
+                    if draw_seps and row_h_k >= 3:
+                        # Last pixel of this key row — solid, no AA
+                        _h_sep(0, ky + row_h_k - 1, int(key_w),
+                               QtGui.QColor(160, 160, 160))
                     if pitch % 12 == 0:
                         name = _midi_note_name(pitch)
                         bp.setPen(QtGui.QColor(120, 120, 120))
                         font_sz = max(4, min(7, note_h, key_w // 3))
                         bp.setFont(QtGui.QFont("sans-serif", font_sz))
                         bp.drawText(
-                            QtCore.QRectF(2, ky, key_w - 4, row_h_k),
-                            QtCore.Qt.AlignmentFlag.AlignVCenter
-                            | QtCore.Qt.TextFlag.TextSingleLine, name)
+                            QtCore.QRect(2, ky, max(1, int(key_w) - 4),
+                                         int(row_h_k)),
+                            int(QtCore.Qt.AlignmentFlag.AlignVCenter
+                                | QtCore.Qt.TextFlag.TextSingleLine),
+                            name)
                 # Grid backgrounds (horizontal stripes)
                 for pitch in range(MIN_PITCH, MAX_PITCH + 1):
-                    y = _dist_y(pitch, note_h, extra)
+                    y = int(round(_dist_y(pitch, note_h, extra)))
                     row_h_g = _dist_h(pitch, note_h, extra)
                     is_white = (pitch % 12) in _KEY_WHITE
                     c = (QtGui.QColor(38, 38, 42) if is_white
                          else QtGui.QColor(22, 22, 25))
-                    bp.fillRect(QtCore.QRectF(key_w, y, grid_w, row_h_g), c)
-                    bp.setPen(QtGui.QColor(45, 45, 50))
-                    bp.drawLine(QtCore.QPointF(key_w, y),
-                                QtCore.QPointF(self._w, y))
+                    bp.fillRect(int(key_w), y, int(grid_w), int(row_h_g), c)
+                    if draw_seps and row_h_g >= 3:
+                        _h_sep(int(key_w), y, self._w,
+                               QtGui.QColor(45, 45, 50))
             bp.end()
 
             # ── Pre-compute cached note drawing params (pixel coords) ───────
@@ -870,7 +900,7 @@ class VideoExportWorker(QtCore.QThread):
                 a_codec = _audio_mux_args(self._a_codec, self._a_br)
                 # Write final file with seek-friendly index (Cues / moov)
                 cmd = [
-                    _ffmpeg, "-y",
+                    _ffmpeg, "-y", "-nostdin",
                     "-i", tmp_video, "-i", tmp_audio,
                     "-c:v", "copy", *a_codec,
                     *_container_mux_args(self._output),
@@ -879,7 +909,7 @@ class VideoExportWorker(QtCore.QThread):
                     "-progress", "pipe:1",
                     "-shortest", "-nostats", self._output,
                 ]
-                proc = subprocess.Popen(
+                proc = popen_hidden(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, encoding="utf-8", errors="replace",
                 )
@@ -1151,7 +1181,11 @@ def _ffmpeg_audio_args(fmt: str, bitrate: str, codec: str = "") -> list[str]:
         q = max(0, min(10, int(round((br_num - 64) / 25.6))))
         return ["-c:a", "libvorbis", "-q:a", str(q)]
     if c in ("flac",):
-        return ["-c:a", "flac"]
+        # Native .flac container, or FLAC-in-Ogg (.ogg) for broader pipeline use
+        args = ["-c:a", "flac"]
+        if fmt in ("ogg", "oga"):
+            args += ["-f", "ogg"]
+        return args
     if c in ("pcm", "wav", "pcm_s16le"):
         return ["-c:a", "pcm_s16le"]
     return ["-c:a", "aac", "-b:a", br]
@@ -1162,7 +1196,7 @@ STANDALONE_AUDIO_BY_EXT: dict[str, list[tuple[str, str]]] = {
     ".mp3":  [("MP3", "mp3")],
     ".aac":  [("AAC", "aac")],
     ".m4a":  [("AAC", "aac"), ("Opus", "opus")],
-    ".ogg":  [("Vorbis", "vorbis"), ("Opus", "opus")],
+    ".ogg":  [("Vorbis", "vorbis"), ("Opus", "opus"), ("FLAC", "flac")],
     ".flac": [("FLAC", "flac")],
     ".wav":  [("PCM", "pcm")],
 }
@@ -1201,8 +1235,7 @@ def _convert_wav_with_ffmpeg(wav_path: str, output_path: str,
     """
     import os
     import shutil
-    import subprocess
-    from imageio_ffmpeg import get_ffmpeg_exe
+    from .win32_utils import get_ffmpeg_exe, run_hidden
 
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1218,13 +1251,13 @@ def _convert_wav_with_ffmpeg(wav_path: str, output_path: str,
 
     ffmpeg = get_ffmpeg_exe()
     cmd = [
-        ffmpeg, "-y",
+        ffmpeg, "-y", "-nostdin",
         "-i", wav_path,
         *_ffmpeg_audio_args(fmt, bitrate, codec),
         "-vn",
         str(out),
     ]
-    proc = subprocess.run(
+    proc = run_hidden(
         cmd, capture_output=True, text=True, encoding="utf-8",
         errors="replace",
     )
