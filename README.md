@@ -61,3 +61,16 @@ uv run python -m pianolotayu song.mp3 \
 ## License
 
 MIT
+
+## Package Linux
+
+```
+PYTHONPATH=src python -m nuitka --standalone --output-dir=build --enable-plugin=pyside6 --enable-plugin=upx --include-package=imageio_ffmpeg --include-data-files=icon.ico=icon.ico --nofollow-import-to=imageio --nofollow-import-to=pydub --nofollow-import-to=tkinter --nofollow-import-to=matplotlib --nofollow-import-to=pytest --nofollow-import-to=IPython --nofollow-import-to=jupyter --nofollow-import-to=setuptools --nofollow-import-to=pip --nofollow-import-to=unittest --nofollow-import-to=PySide6.QtWebEngine --nofollow-import-to=PySide6.QtWebEngineCore --nofollow-import-to=PySide6.QtWebEngineWidgets --nofollow-import-to=PySide6.QtQml --nofollow-import-to=PySide6.QtQuick --nofollow-import-to=PySide6.QtMultimedia --nofollow-import-to=PySide6.Qt3DCore --nofollow-import-to=PySide6.QtCharts --nofollow-import-to=PySide6.QtDataVisualization --nofollow-import-to=PySide6.QtBluetooth --nofollow-import-to=PySide6.QtNfc --nofollow-import-to=PySide6.QtPositioning --nofollow-import-to=PySide6.QtSensors --nofollow-import-to=PySide6.QtSql --nofollow-import-to=PySide6.QtTest --noinclude-dlls=libfluidsynth* --noinclude-pytest-mode=nofollow --noinclude-setuptools-mode=nofollow --noinclude-unittest-mode=nofollow --include-qt-plugins=sensible --static-libpython=no --assume-yes-for-downloads --remove-output --output-filename=pianolotayu-gui --linux-icon=icon.ico entry_gui.py
+
+```
+
+## Package Windows
+
+```
+$env:PYTHONPATH = "$PWD\src" ; python -m nuitka --standalone --output-dir=build --output-filename=pianolotayu-gui.exe --windows-console-mode=attach --enable-plugin=pyside6 --enable-plugin=upx --include-package=imageio_ffmpeg --include-data-files=icon.ico=icon.ico --windows-icon-from-ico=icon.ico --include-qt-plugins=sensible,styles,platforms,iconengines,imageformats --nofollow-import-to=imageio --nofollow-import-to=pydub --nofollow-import-to=librosa --nofollow-import-to=scipy --nofollow-import-to=numba --nofollow-import-to=llvmlite --nofollow-import-to=sklearn --nofollow-import-to=tkinter --nofollow-import-to=matplotlib --nofollow-import-to=pytest --nofollow-import-to=IPython --nofollow-import-to=jupyter --nofollow-import-to=setuptools --nofollow-import-to=pip --nofollow-import-to=unittest --nofollow-import-to=PySide6.QtWebEngine --nofollow-import-to=PySide6.QtWebEngineCore --nofollow-import-to=PySide6.QtWebEngineWidgets --nofollow-import-to=PySide6.QtQml --nofollow-import-to=PySide6.QtQuick --nofollow-import-to=PySide6.QtMultimedia --nofollow-import-to=PySide6.Qt3DCore --nofollow-import-to=PySide6.QtCharts --nofollow-import-to=PySide6.QtDataVisualization --nofollow-import-to=PySide6.QtBluetooth --nofollow-import-to=PySide6.QtNfc --nofollow-import-to=PySide6.QtPositioning --nofollow-import-to=PySide6.QtSensors --nofollow-import-to=PySide6.QtSql --nofollow-import-to=PySide6.QtTest --noinclude-dlls=libfluidsynth* --noinclude-dlls=fluidsynth* --noinclude-pytest-mode=nofollow --noinclude-setuptools-mode=nofollow --noinclude-unittest-mode=nofollow --assume-yes-for-downloads --remove-output entry_gui.py
+```

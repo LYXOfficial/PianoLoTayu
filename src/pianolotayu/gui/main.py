@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 # ── Detect system Qt plugin path before PySide6 imports ──────────────────
@@ -32,6 +33,7 @@ from .win32_utils import (
     TaskbarProgress, BeepSuppressor, app_icon, set_app_user_model_id,
     enable_elevated_file_drop, reassert_elevated_file_drop,
     prepare_elevated_drop_filters, is_process_elevated,
+    attach_parent_console, log_console,
 )
 from ..config import DEFAULTS, VERSION
 import traceback
@@ -124,9 +126,22 @@ _WIDGET_CONFIG_MAP = {
 class ConversionWorker(QtCore.QThread):
     """Runs the audio→MIDI pipeline in a background thread."""
 
-    progress = QtCore.Signal(int)        # 0–100
-    finished = QtCore.Signal(str)        # output path
-    error = QtCore.Signal(str)           # error message
+    # Fine-grained 0–1000 so the UI can animate without 10–20% jumps.
+    progress = QtCore.Signal(int)
+    # Do NOT name this ``finished`` — that shadows QThread.finished and
+    # can break thread lifetime / wait() on some platforms (invalid handle).
+    succeeded = QtCore.Signal(str)      # output path
+    failed = QtCore.Signal(str)         # error message
+
+    # Stage map: (start_permille, end_permille)
+    # Tiny leading "placebo" band so the bar moves as soon as convert starts
+    # (import + open file can take a second with zero real work reported).
+    _STAGE_BOOT = (0, 30)          # click → imports ready
+    _STAGE_LOAD = (30, 100)        # load_audio
+    _STAGE_STFT = (100, 500)       # compute_stft
+    _STAGE_ANALYZE = (500, 780)    # analyze_frames
+    _STAGE_MIDI = (780, 950)       # create_midi
+    _STAGE_SAVE = (950, 1000)      # write .mid
 
     def __init__(self, input_path: str, output_path: str, config: dict,
                  parent=None):
@@ -135,31 +150,107 @@ class ConversionWorker(QtCore.QThread):
         self._output = output_path
         self._cfg = config
 
+    def _emit_stage(self, stage: tuple[int, int], frac: float) -> None:
+        """Map a 0–1 stage fraction into overall 0–1000 progress."""
+        lo, hi = stage
+        frac = 0.0 if frac < 0.0 else (1.0 if frac > 1.0 else float(frac))
+        self.progress.emit(int(lo + (hi - lo) * frac))
+
+    def _say(self, text: str) -> None:
+        try:
+            log_console(f"[convert] {text}")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _call_with_optional_progress(fn, *args, progress_cb=None, **kwargs):
+        """Call *fn*; pass progress_cb only if the function accepts it.
+
+        Lets a partially-synced tree (new main.py + old analysis.py) keep
+        working instead of raising TypeError.
+        """
+        import inspect
+        try:
+            params = inspect.signature(fn).parameters
+            accepts = (
+                "progress_cb" in params
+                or any(p.kind == inspect.Parameter.VAR_KEYWORD
+                       for p in params.values())
+            )
+        except (TypeError, ValueError):
+            accepts = False
+        if accepts and progress_cb is not None:
+            kwargs["progress_cb"] = progress_cb
+        return fn(*args, **kwargs)
+
     def run(self) -> None:
         try:
-            # Heavy deps (numpy/librosa/scipy) only when converting
+            # Immediate placebo so the bar isn't stuck at 0 while heavy imports load
+            self._say("boot…")
+            self._emit_stage(self._STAGE_BOOT, 0.15)
+            if self.isInterruptionRequested():
+                return
+
+            # Convert path: numpy + soundfile, ffmpeg fallback via imageio-ffmpeg
+            self._say("import convert modules…")
             from ..convert.audio import load_audio, compute_stft
+            self._emit_stage(self._STAGE_BOOT, 0.55)
             from ..convert.analysis import analyze_frames
+            self._emit_stage(self._STAGE_BOOT, 0.8)
             from ..convert.midi_writer import create_midi, save_midi
-
-            self.progress.emit(5)
-            if self.isInterruptionRequested():
-                return
-            signal, sr = load_audio(self._input, sr=self._cfg["sr"])
-            self.progress.emit(15)
+            self._emit_stage(self._STAGE_BOOT, 1.0)
             if self.isInterruptionRequested():
                 return
 
-            D_db, freqs, times = compute_stft(
+            self._say(f"load audio: {self._input}")
+            self._emit_stage(self._STAGE_LOAD, 0.0)
+
+            def _on_load(frac: float) -> None:
+                if not self.isInterruptionRequested():
+                    self._emit_stage(self._STAGE_LOAD, frac)
+
+            signal, sr = load_audio(
+                self._input, sr=self._cfg["sr"], progress_cb=_on_load,
+            )
+            self._emit_stage(self._STAGE_LOAD, 1.0)
+            if self.isInterruptionRequested():
+                return
+
+            self._say(
+                f"loaded {len(signal)} samples @ {sr} Hz "
+                f"({len(signal) / max(sr, 1):.1f}s) — STFT…"
+            )
+            # STFT is often the long silent gap after load (esp. hop=256).
+            self._emit_stage(self._STAGE_STFT, 0.0)
+
+            def _on_stft(frac: float) -> None:
+                if not self.isInterruptionRequested():
+                    self._emit_stage(self._STAGE_STFT, frac)
+
+            D_db, freqs, times = self._call_with_optional_progress(
+                compute_stft,
                 signal, sr,
                 n_fft=self._cfg["n_fft"],
                 hop_length=self._cfg["hop_length"],
+                progress_cb=_on_stft,
             )
-            self.progress.emit(30)
+            # Free waveform ASAP — STFT already holds the spectrum
+            del signal
+            self._emit_stage(self._STAGE_STFT, 1.0)
             if self.isInterruptionRequested():
                 return
 
-            frame_notes = analyze_frames(
+            self._say(
+                f"STFT done {getattr(D_db, 'shape', None)} — analyze…"
+            )
+            self._emit_stage(self._STAGE_ANALYZE, 0.0)
+
+            def _on_analyze(frac: float) -> None:
+                if not self.isInterruptionRequested():
+                    self._emit_stage(self._STAGE_ANALYZE, frac)
+
+            frame_notes = self._call_with_optional_progress(
+                analyze_frames,
                 D_db, freqs, times, sr, self._cfg["hop_length"],
                 threshold_db=self._cfg["threshold"],
                 max_notes=self._cfg["max_notes"],
@@ -167,26 +258,41 @@ class ConversionWorker(QtCore.QThread):
                 piano_limit=not self._cfg["no_piano_limit"],
                 high_damp=self._cfg["high_damp"],
                 mid_boost=self._cfg["mid_boost"],
+                progress_cb=_on_analyze,
             )
-            self.progress.emit(75)
+            del D_db
+            self._emit_stage(self._STAGE_ANALYZE, 1.0)
             if self.isInterruptionRequested():
                 return
 
-            midi = create_midi(
+            self._say("build MIDI…")
+            def _on_midi(frac: float) -> None:
+                if not self.isInterruptionRequested():
+                    self._emit_stage(self._STAGE_MIDI, frac)
+
+            midi = self._call_with_optional_progress(
+                create_midi,
                 frame_notes, sr, self._cfg["hop_length"],
                 min_duration_ms=self._cfg["min_duration"],
+                progress_cb=_on_midi,
             )
-            self.progress.emit(90)
+            self._emit_stage(self._STAGE_MIDI, 1.0)
             if self.isInterruptionRequested():
                 return
 
+            self._emit_stage(self._STAGE_SAVE, 0.0)
             save_midi(midi, self._output)
-            self.progress.emit(100)
-            self.finished.emit(self._output)
+            self._emit_stage(self._STAGE_SAVE, 1.0)
+            self._say(f"done → {self._output}")
+            self.succeeded.emit(self._output)
 
         except Exception as exc:
-            self.error.emit(f"{type(exc).__name__}：{exc}\n\n"
-                            f"{traceback.format_exc()}")
+            msg = f"{type(exc).__name__}：{exc}\n\n{traceback.format_exc()}"
+            try:
+                log_console(f"[convert] ERROR\n{msg}")
+            except Exception:
+                pass
+            self.failed.emit(msg)
 
 
 class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
@@ -198,6 +304,20 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
         self._taskbar = TaskbarProgress(self)
         self._elevated_drop_filter = None  # keep alive for WM_DROPFILES
         self._elevated_drag_poll: QtCore.QTimer | None = None
+        # Smooth progress: worker reports 0–1000; UI linearly interpolates
+        self._prog_target = 0.0
+        self._prog_display = 0.0
+        self._prog_active = False
+        self._prog_lerp_from = 0.0
+        self._prog_lerp_to = 0.0
+        self._prog_lerp_t0 = 0.0
+        self._prog_lerp_dur = 0.25  # seconds
+        self._prog_timer = QtCore.QTimer(self)
+        self._prog_timer.setInterval(16)  # ~60 fps
+        self._prog_timer.timeout.connect(self._tick_progress)
+        # Finer bar range so 1‰ steps are visible (Windows taskbar too)
+        self.progressBar.setRange(0, 1000)
+        self.progressBar.setValue(0)
         self._init_drop_area()
         self._init_io()
         self._init_convert()
@@ -315,9 +435,14 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
                 if self._worker.isRunning():
                     self._worker.requestInterruption()
                     self._worker.quit()
-                    self._worker.wait(3000)
-            except RuntimeError:
-                pass  # C++ object already deleted
+                    try:
+                        self._worker.wait(3000)
+                    except Exception:
+                        # WinError 6 if native handle already gone
+                        pass
+            except Exception:
+                pass
+            self._worker = None
         super().closeEvent(event)
 
     def _init_drop_area(self) -> None:
@@ -422,67 +547,216 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
             self,
         )
         self._worker.progress.connect(self._on_progress)
-        self._worker.finished.connect(self._on_conversion_done)
-        self._worker.error.connect(self._on_conversion_error)
+        self._worker.succeeded.connect(self._on_conversion_done)
+        self._worker.failed.connect(self._on_conversion_error)
 
-        self.progressBar.setValue(0)
+        self._prog_active = True
+        # Placebo: linear lerp 0 → ~1.2% so the bar isn't empty during import
+        self._begin_prog_lerp(0.0, 12.0, duration=0.20)
+        self._prog_timer.start()
         self.convertButton.setEnabled(False)
         self._worker.start()
 
-    def _on_progress(self, pct: int) -> None:
-        self.progressBar.setValue(pct)
-        self._taskbar.show_normal(pct)
+    def _begin_prog_lerp(
+        self, start: float, end: float, duration: float | None = None,
+    ) -> None:
+        """Start a linear interpolation of the displayed progress."""
+        start = max(0.0, min(1000.0, float(start)))
+        end = max(0.0, min(1000.0, float(end)))
+        if end < start:
+            end = start  # progress only moves forward
+        self._prog_lerp_from = start
+        self._prog_lerp_to = end
+        self._prog_target = end
+        self._prog_display = start
+        self._prog_lerp_t0 = time.monotonic()
+        if duration is None:
+            gap = end - start
+            # Small gaps (boot/load steps) still get a visible glide
+            duration = max(0.10, min(0.28, 0.10 + gap / 1000.0 * 0.25))
+        self._prog_lerp_dur = max(0.08, float(duration))
+        if not self._prog_timer.isActive():
+            self._prog_timer.start()
+
+    def _on_progress(self, permille: int) -> None:
+        """Worker reports 0–1000; always ease toward it with linear interpolation.
+
+        Extend the target from the *current displayed* value — do not snap
+        small steps (that removed boot/load glide) and do not reset display
+        to an old start (that made stages look frozen then jump).
+        """
+        new = max(self._prog_target, float(permille))
+        if new <= self._prog_display + 0.15 and new <= self._prog_target + 0.15:
+            return
+        # If a lerp is mid-flight, continue from wherever the bar is now
+        self._prog_lerp_from = self._prog_display
+        self._prog_lerp_to = new
+        self._prog_target = new
+        self._prog_lerp_t0 = time.monotonic()
+        gap = max(0.0, new - self._prog_display)
+        # Boot/load are only ~3–7% of the bar; give those steps enough time
+        # to read as motion. Dense STFT/analyze ticks use a shorter glide.
+        if gap <= 25:
+            self._prog_lerp_dur = max(0.12, min(0.28, 0.12 + gap / 1000.0 * 0.40))
+        else:
+            self._prog_lerp_dur = max(0.08, min(0.22, 0.08 + gap / 1000.0 * 0.18))
+        if not self._prog_timer.isActive():
+            self._prog_timer.start()
+
+    def _tick_progress(self) -> None:
+        """~60 Hz linear interpolation of the bar/taskbar toward the target."""
+        elapsed = time.monotonic() - self._prog_lerp_t0
+        dur = self._prog_lerp_dur if self._prog_lerp_dur > 0 else 0.05
+        t = elapsed / dur
+        if t >= 1.0:
+            self._prog_display = self._prog_lerp_to
+            t = 1.0
+        else:
+            # Linear: display = from + (to - from) * t
+            self._prog_display = (
+                self._prog_lerp_from
+                + (self._prog_lerp_to - self._prog_lerp_from) * t
+            )
+        val = int(round(self._prog_display))
+        val = 0 if val < 0 else (1000 if val > 1000 else val)
+        if self.progressBar.value() != val:
+            self.progressBar.setValue(val)
+        self._taskbar.show_normal(val, 1000)
+        if t >= 1.0 and not self._prog_active:
+            self._prog_timer.stop()
+
+    def _stop_progress(self, final: int | None = None) -> None:
+        """Stop smoothing; optionally snap bar to *final* (0–1000)."""
+        self._prog_active = False
+        if final is not None:
+            self._prog_lerp_from = float(final)
+            self._prog_lerp_to = float(final)
+            self._prog_target = float(final)
+            self._prog_display = float(final)
+            self.progressBar.setValue(final)
+            if final > 0:
+                self._taskbar.show_normal(final, 1000)
+        self._prog_timer.stop()
 
     def _on_conversion_done(self, output: str) -> None:
-        if self._worker is not None:
-            self._worker.wait(5000)
-            self._worker = None
-        self.convertButton.setEnabled(True)
-        self.previewButton.setEnabled(True)
-        self.progressBar.setValue(100)
-        self._taskbar.hide()
-        self._show_success_dialog(Path(output))
+        # Never wait() on the QThread here — under Nuitka attach + Explorer
+        # launch, the native thread handle can already be invalid (WinError 6).
+        worker = self._worker
+        self._worker = None
+        if worker is not None:
+            for sig_name in ("progress", "succeeded", "failed"):
+                try:
+                    getattr(worker, sig_name).disconnect()
+                except Exception:
+                    pass
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+        try:
+            self.convertButton.setEnabled(True)
+            self.previewButton.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            self._stop_progress(1000)
+        except Exception:
+            pass
+        try:
+            self._taskbar.hide()
+        except Exception:
+            pass
+        try:
+            self._show_success_dialog(Path(output))
+        except Exception as exc:
+            try:
+                log_console(f"[convert] success UI error: {exc}")
+            except Exception:
+                pass
+            try:
+                QtWidgets.QMessageBox.information(
+                    self, "转换完成", f"MIDI 已保存至：\n{output}",
+                )
+            except Exception:
+                pass
 
     @staticmethod
     def _friendly_error(msg: str) -> str:
         """Map raw exception text to a short user-facing message."""
         lower = msg.lower()
+        if "moov" in lower or "损坏或不完整" in msg:
+            lines = [ln for ln in msg.splitlines() if ln.strip()]
+            return "\n".join(lines[:3]) if lines else msg
+        if "无法识别为有效音频" in msg or "invalid data found" in lower:
+            lines = [ln for ln in msg.splitlines() if ln.strip()]
+            return "\n".join(lines[:3]) if lines else "音频文件无效或已损坏"
+        if "解码超时" in msg or "timeout" in lower:
+            lines = [ln for ln in msg.splitlines() if ln.strip()]
+            return "\n".join(lines[:3]) if lines else "解码超时，请换文件或格式"
+        if "无法解码音频" in msg:
+            return "无法解码该音频文件，请确认格式完整且可播放"
+        if "句柄无效" in msg or "winerror 6" in lower or "error 6" in lower:
+            return (
+                "内部句柄错误（多见于无控制台启动时的日志绑定问题，"
+                "请更新后重试；不影响已生成的文件时可直接打开输出）"
+            )
         if "nobackenderror" in lower:
             return "不支持的文件格式，请检查文件是否损坏或格式是否正确"
-        if "filenotfounderror" in lower:
+        if "filenotfounderror" in lower or "找不到文件" in msg:
             return "找不到输入文件"
         if "permissionerror" in lower:
             return "没有读取或写入文件的权限"
         if "memoryerror" in lower:
             return "内存不足，请尝试降低采样率或 FFT 窗口大小"
-        # Generic: extract the exception class name
         import re
         m = re.match(r"(\w+Error|\w+Exception)", msg)
         if m:
             return f"转换失败：{m.group(1)}"
+        for ln in msg.splitlines():
+            if ln.strip():
+                return ln.strip()[:200]
         return "转换过程中出现未知错误"
 
     def _on_conversion_error(self, msg: str) -> None:
-        if self._worker is not None:
-            self._worker.wait(5000)
-            self._worker = None
-        self.convertButton.setEnabled(True)
-        self.progressBar.setValue(0)
-        self._taskbar.show_error(0)
+        worker = self._worker
+        self._worker = None
+        if worker is not None:
+            for sig_name in ("progress", "succeeded", "failed"):
+                try:
+                    getattr(worker, sig_name).disconnect()
+                except Exception:
+                    pass
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+        try:
+            self.convertButton.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            self._stop_progress(0)
+        except Exception:
+            pass
+        try:
+            self._taskbar.show_error(0, 1000)
+        except Exception:
+            pass
 
         friendly = self._friendly_error(msg)
-
-        box = QtWidgets.QMessageBox(self)
-        box.setWindowTitle("转换失败")
-        box.setText(friendly)
-        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-
-        btn_ok = box.addButton("确定", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        btn_detail = box.addButton("详细信息…", QtWidgets.QMessageBox.ButtonRole.HelpRole)
-        box.exec()
-
-        if box.clickedButton() is btn_detail:
-            self._show_error_detail(msg)
+        try:
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("转换失败")
+            box.setText(friendly)
+            box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+            box.addButton("确定", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            btn_detail = box.addButton(
+                "详细信息…", QtWidgets.QMessageBox.ButtonRole.HelpRole)
+            box.exec()
+            if box.clickedButton() is btn_detail:
+                self._show_error_detail(msg)
+        except Exception:
+            pass
 
     @staticmethod
     def _show_error_detail(text: str) -> None:
@@ -516,7 +790,6 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
             self._open_preview()
 
     # ── File openers ────────────────────────────────────────────────────
-    @staticmethod
     @staticmethod
     def _open_folder(path: Path) -> None:
         QtGui.QDesktopServices.openUrl(
@@ -577,8 +850,210 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
         return cfg
 
 
+def _ensure_system_qt_plugins() -> None:
+    """When frozen, still look for *system* Qt plugins (styles, platformthemes).
+
+    Nuitka ``--enable-plugin=pyside6`` only ships a small plugin set.  Without
+    system paths the platform theme cannot load the user's Breeze/Oxygen/… style
+    and the app sticks on Fusion.  Prepend distro plugin dirs when present.
+    """
+    import sys
+    if sys.platform in ("win32", "darwin"):
+        return
+    candidates = [
+        Path("/usr/lib/qt6/plugins"),
+        Path("/usr/lib64/qt6/plugins"),
+        Path("/usr/lib/x86_64-linux-gnu/qt6/plugins"),
+        Path("/usr/lib/qt/plugins"),
+        Path("/usr/lib64/qt/plugins"),
+    ]
+    existing = [
+        str(p) for p in candidates
+        if p.is_dir() and any(p.iterdir())
+    ]
+    if not existing:
+        return
+    cur = os.environ.get("QT_PLUGIN_PATH", "")
+    parts = [p for p in cur.split(os.pathsep) if p]
+    for d in reversed(existing):
+        if d not in parts:
+            parts.insert(0, d)
+    os.environ["QT_PLUGIN_PATH"] = os.pathsep.join(parts)
+
+
+def _linux_desktop_hints() -> tuple[str, str]:
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+    session = os.environ.get("DESKTOP_SESSION", "").lower()
+    return desktop, session
+
+
+def _configure_linux_platform_theme() -> None:
+    """Point Qt at the DE's platform theme so *its* style/settings apply.
+
+    Does not pick Breeze/Oxygen itself — KDE/GNOME/qt6ct do that.
+    """
+    if os.environ.get("QT_QPA_PLATFORMTHEME"):
+        return
+    desktop, session = _linux_desktop_hints()
+    blob = f"{desktop} {session}"
+    if any(k in blob for k in ("kde", "plasma", "lxqt")):
+        os.environ.setdefault("QT_QPA_PLATFORMTHEME", "kde")
+    elif any(k in blob for k in ("gnome", "unity", "cinnamon", "mate", "xfce", "gtk")):
+        os.environ.setdefault("QT_QPA_PLATFORMTHEME", "gtk3")
+    elif Path.home().joinpath(".config/qt6ct/qt6ct.conf").is_file():
+        os.environ.setdefault("QT_QPA_PLATFORMTHEME", "qt6ct")
+    elif Path.home().joinpath(".config/qt5ct/qt5ct.conf").is_file():
+        os.environ.setdefault("QT_QPA_PLATFORMTHEME", "qt5ct")
+
+
+def _read_system_widget_style() -> str | None:
+    """Best-effort: style name the desktop was configured to use (Linux).
+
+    Used only when the platform theme failed to apply and we are stuck on a
+    generic fallback (e.g. Fusion in a frozen build).  Never invents a
+    preference order — returns whatever the user/system config says.
+    """
+    # Explicit user/env override (honour if set and not a bad pin we cleared)
+    env = os.environ.get("QT_STYLE_OVERRIDE", "").strip()
+    if env:
+        return env
+
+    # KDE Plasma: ~/.config/kdeglobals → [KDE] widgetStyle=…
+    kdeglobals = Path.home() / ".config" / "kdeglobals"
+    if kdeglobals.is_file():
+        try:
+            section = ""
+            for raw in kdeglobals.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw.strip()
+                if line.startswith("[") and line.endswith("]"):
+                    section = line[1:-1]
+                    continue
+                if section == "KDE" and "=" in line:
+                    key, _, val = line.partition("=")
+                    if key.strip() == "widgetStyle":
+                        name = val.strip()
+                        if name:
+                            return name
+        except OSError:
+            pass
+
+    # qt6ct / qt5ct
+    for conf_rel in ("qt6ct/qt6ct.conf", "qt5ct/qt5ct.conf"):
+        conf = Path.home() / ".config" / conf_rel
+        if not conf.is_file():
+            continue
+        try:
+            section = ""
+            for raw in conf.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw.strip()
+                if line.startswith("[") and line.endswith("]"):
+                    section = line[1:-1]
+                    continue
+                if section == "Appearance" and line.startswith("style="):
+                    name = line.split("=", 1)[1].strip()
+                    if name:
+                        return name
+        except OSError:
+            pass
+    return None
+
+
+def _apply_platform_style(app: QtWidgets.QApplication) -> None:
+    """Follow the system style; only patch bad frozen/classic fallbacks.
+
+    Linux: do **not** force Breeze/Oxygen.  Platform theme + system config
+    choose the style.  We only intervene if Qt landed on a useless fallback.
+
+    Windows: prefer windows11/windowsvista over classic Win9x / bare Fusion.
+    """
+    import sys
+
+    def _try_set(name: str) -> bool:
+        if not name:
+            return False
+        # Case-insensitive match against factory keys
+        keys = {str(n).lower(): str(n) for n in QtWidgets.QStyleFactory.keys()}
+        actual = keys.get(name.lower(), name)
+        style = QtWidgets.QStyleFactory.create(actual)
+        if style is None and actual != name:
+            style = QtWidgets.QStyleFactory.create(name)
+        if style is None:
+            return False
+        app.setStyle(style)
+        return True
+
+    def _current_key() -> str:
+        st = app.style()
+        return ((st.objectName() if st is not None else "") or "").lower()
+
+    if sys.platform not in ("win32", "darwin"):
+        # Linux: make system style plugins visible to a frozen binary
+        for d in (
+            "/usr/lib/qt6/plugins",
+            "/usr/lib64/qt6/plugins",
+            "/usr/lib/x86_64-linux-gnu/qt6/plugins",
+            "/usr/lib/qt/plugins",
+        ):
+            p = Path(d)
+            if p.is_dir():
+                app.addLibraryPath(str(p))
+
+        cur = _current_key()
+        # Platform theme already applied something real → leave it alone.
+        # Fusion is only "bad" when the user actually configured another style.
+        configured = _read_system_widget_style()
+        if configured:
+            want = configured.lower()
+            if cur == want or cur.replace("-", "") == want.replace("-", ""):
+                return
+            # Stuck on fusion/windows while the desktop wants something else
+            if cur in ("fusion", "windows", "windowsonly", ""):
+                if _try_set(configured):
+                    return
+        # No config, or config style unavailable: keep whatever Qt chose
+        # (including Fusion).  Do not rank Breeze over Oxygen ourselves.
+        return
+
+    if sys.platform == "darwin":
+        if _current_key() not in ("macos", "macintosh"):
+            if not _try_set("macos"):
+                _try_set("Fusion")
+        return
+
+    # Windows: avoid classic 9x look, but match the OS generation.
+    # Qt 6.7+ ships a "windows11" style plugin that works on Win10 too —
+    # if we always try it first, late Win10 + new PySide looks like Win11.
+    # Prefer windows11 only on real Windows 11 (build ≥ 22000).
+    win_ver = sys.getwindowsversion()
+    is_win11 = int(getattr(win_ver, "build", 0) or 0) >= 22000
+    preferred = ("windows11", "windowsvista") if is_win11 else ("windowsvista",)
+    for name in preferred:
+        if _try_set(name):
+            return
+    if _current_key() in ("windows", "windowsonly", ""):
+        _try_set("Fusion")
+
+
 def main() -> int:
     import signal
+    import sys
+
+    # Windows: reconnect print() to the parent console when launched from
+    # PowerShell/cmd with Nuitka --windows-console-mode=attach (otherwise
+    # sys.stdout is often None and logs vanish).
+    # Always sanitize broken OS STD_* handles afterwards — Explorer double-click
+    # leaves INVALID_HANDLE_VALUE; children inherit it → WinError 6 句柄无效.
+    try:
+        from .win32_utils import attach_parent_console, sanitize_std_handles
+        if attach_parent_console():
+            log_console(f"PianoLoTayu GUI starting (pid={os.getpid()})")
+        sanitize_std_handles()
+    except Exception:
+        try:
+            from .win32_utils import sanitize_std_handles
+            sanitize_std_handles()
+        except Exception:
+            pass
 
     # Windows: own taskbar identity (must be before QApplication)
     set_app_user_model_id("PianoLoTayu")
@@ -593,9 +1068,22 @@ def main() -> int:
     except Exception:
         pass
 
+    if sys.platform not in ("win32", "darwin"):
+        # Frozen Linux: load system styles/platformthemes; follow DE settings
+        _ensure_system_qt_plugins()
+        _configure_linux_platform_theme()
+
     app = QtWidgets.QApplication()
     app.setApplicationName("PianoLoTayu")
     app.setOrganizationName("PianoLoTayu")
+    try:
+        app.setDesktopFileName("pianolotayu")
+    except Exception:
+        pass
+
+    # Linux: honour system style.  Windows: avoid classic chrome.
+    _apply_platform_style(app)
+
     icon = app_icon()
     if not icon.isNull():
         app.setWindowIcon(icon)

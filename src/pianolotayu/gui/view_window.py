@@ -12,12 +12,15 @@ from .piano_view import (
     KeyboardWidget, NoteGridView, MidiPlayer,
     PlaybackOptions, default_track_enabled, list_track_infos,
 )
-from .win32_utils import TaskbarProgress, app_icon
+from .win32_utils import TaskbarProgress, app_icon, soundfont_dir
 
 if TYPE_CHECKING:
     from .export import VideoExportWorker, AudioExportWorker
 
-_SOUNDFONT_DIR = Path(__file__).resolve().parents[3] / "soundfonts"
+
+def _soundfont_dir() -> Path:
+    """Resolve soundfonts/ next to the exe (frozen) or repo root (dev)."""
+    return soundfont_dir()
 
 
 def _std_icon(name: str, fallback: QtWidgets.QStyle.StandardPixmap) -> QtGui.QIcon:
@@ -148,7 +151,7 @@ class PianoRollWindow(QtWidgets.QWidget):
         # ── Top controls ────────────────────────────────────────────────
         self._sf_combo = QtWidgets.QComboBox(self)
         self._sf_combo.addItem("（无 SoundFont — 静音预览）", "")
-        for sf in sorted(_SOUNDFONT_DIR.glob("*.sf2")):
+        for sf in sorted(_soundfont_dir().glob("*.sf2")):
             self._sf_combo.addItem(sf.name, str(sf))
         if self._sf_combo.count() > 1:
             self._sf_combo.setCurrentIndex(1)
@@ -808,9 +811,17 @@ class PianoRollWindow(QtWidgets.QWidget):
             if self._mono_cb.isChecked():
                 self._grid.set_mono(self._mono_hex)
 
+    def _pause_if_playing(self) -> None:
+        """Stop preview audio when opening a modal export dialog."""
+        if self._playing:
+            self._player.pause()
+            self._playing = False
+            self._set_play_button(False)
+
     # ── Video export ────────────────────────────────────────────────────
     def _on_export(self) -> None:
         """Open video export dialog, then start rendering."""
+        self._pause_if_playing()
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("导出视频")
         dlg.setMinimumWidth(240)
@@ -946,7 +957,7 @@ class PianoRollWindow(QtWidgets.QWidget):
         sf_row = QtWidgets.QHBoxLayout()
         sf_combo_export = QtWidgets.QComboBox(dlg)
         sf_combo_export.addItem("（无 SoundFont — 静音）", "")
-        for sf_path in sorted(_SOUNDFONT_DIR.glob("*.sf2")):
+        for sf_path in sorted(_soundfont_dir().glob("*.sf2")):
             sf_combo_export.addItem(sf_path.name, str(sf_path))
         # Default to same SF as preview window, or first available
         _cur_sf = self._sf_combo.currentData()
@@ -1209,6 +1220,7 @@ class PianoRollWindow(QtWidgets.QWidget):
     # ── Audio export ─────────────────────────────────────────────────────
     def _on_export_audio(self) -> None:
         """Open a dialog to configure audio export, then start rendering."""
+        self._pause_if_playing()
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("导出音频")
         dlg.setMinimumWidth(300)
@@ -1230,6 +1242,7 @@ class PianoRollWindow(QtWidgets.QWidget):
             ("Opus (.m4a)",       "opus",   ".m4a"),
             ("Vorbis (.ogg)",     "vorbis", ".ogg"),
             ("Opus (.ogg)",       "opus",   ".ogg"),
+            ("FLAC (.ogg)",       "flac",   ".ogg"),
             ("FLAC (.flac)",      "flac",   ".flac"),
             ("WAV (.wav)",        "pcm",    ".wav"),
         ]
@@ -1251,7 +1264,7 @@ class PianoRollWindow(QtWidgets.QWidget):
         # ── SoundFont ────────────────────────────────────────────────────
         sf_row = QtWidgets.QHBoxLayout()
         sf_combo = QtWidgets.QComboBox(dlg)
-        for sf_path in sorted(_SOUNDFONT_DIR.glob("*.sf2")):
+        for sf_path in sorted(_soundfont_dir().glob("*.sf2")):
             sf_combo.addItem(sf_path.name, str(sf_path))
         if sf_combo.count() == 0:
             sf_combo.addItem("（未找到 SoundFont 文件）", "")

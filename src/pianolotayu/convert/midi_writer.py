@@ -15,6 +15,7 @@ def create_midi(
     hop_length: int,
     min_duration_ms: float = 50.0,
     hysteresis_frames: int = 2,
+    progress_cb=None,
 ) -> pretty_midi.PrettyMIDI:
     """Build a PrettyMIDI object from per-frame note detections.
 
@@ -29,6 +30,8 @@ def create_midi(
         hop_length: Hop length used for STFT.
         min_duration_ms: Minimum note duration; shorter notes are skipped.
         hysteresis_frames: Consecutive absent frames before note-off.
+        progress_cb: Optional ``callable(fraction: float)`` with
+            *fraction* in ``[0.0, 1.0]`` (throttled ~1%% steps).
 
     Returns:
         A pretty_midi.PrettyMIDI object with one Instrument (piano).
@@ -42,19 +45,31 @@ def create_midi(
 
     n_frames = len(frame_notes)
     if n_frames == 0:
+        if progress_cb is not None:
+            progress_cb(1.0)
         pm.instruments.append(instrument)
         return pm
 
     active_notes: dict[int, tuple[float, int, int]] = {}
     min_duration_s = min_duration_ms / 1000.0
+    inv_sr = hop_length / float(sr)
+
+    import time
+    t0 = time.monotonic()
+    last_prog_t = t0
+    last_frac = -1.0
+    if progress_cb is not None:
+        progress_cb(0.0)
 
     for t in range(n_frames):
-        current_time = _frame_to_time(t, hop_length, sr)
-        current_midi_set = {note[0] for note in frame_notes[t]}
+        current_time = t * inv_sr
+        notes_t = frame_notes[t]
+        current_midi_set = {note[0] for note in notes_t}
 
         current_velocities: dict[int, int] = {}
-        for midi, vel in frame_notes[t]:
-            if midi not in current_velocities or vel > current_velocities[midi]:
+        for midi, vel in notes_t:
+            prev = current_velocities.get(midi)
+            if prev is None or vel > prev:
                 current_velocities[midi] = vel
 
         ended_notes: list[int] = []
@@ -74,32 +89,36 @@ def create_midi(
             start_time, velocity, _ = active_notes.pop(midi)
             duration = current_time - start_time
             if duration >= min_duration_s:
-                note = pretty_midi.Note(
-                    velocity=velocity,
-                    pitch=midi,
-                    start=start_time,
-                    end=current_time,
-                )
-                instrument.notes.append(note)
+                instrument.notes.append(pretty_midi.Note(
+                    velocity=velocity, pitch=midi,
+                    start=start_time, end=current_time,
+                ))
 
         for midi in current_midi_set:
             if midi not in active_notes:
-                velocity = current_velocities[midi]
-                active_notes[midi] = (current_time, velocity, 0)
+                active_notes[midi] = (current_time, current_velocities[midi], 0)
 
-    end_time = _frame_to_time(n_frames, hop_length, sr)
+        if progress_cb is not None:
+            now = time.monotonic()
+            if now - last_prog_t >= 0.05 or t + 1 == n_frames:
+                frac = (t + 1) / n_frames
+                if frac - last_frac >= 0.005 or t + 1 == n_frames:
+                    progress_cb(frac)
+                    last_frac = frac
+                    last_prog_t = now
+
+    end_time = n_frames * inv_sr
     for midi, (start_time, velocity, _) in active_notes.items():
         duration = end_time - start_time
         if duration >= min_duration_s:
-            note = pretty_midi.Note(
-                velocity=velocity,
-                pitch=midi,
-                start=start_time,
-                end=end_time,
-            )
-            instrument.notes.append(note)
+            instrument.notes.append(pretty_midi.Note(
+                velocity=velocity, pitch=midi,
+                start=start_time, end=end_time,
+            ))
 
     pm.instruments.append(instrument)
+    if progress_cb is not None:
+        progress_cb(1.0)
     return pm
 
 

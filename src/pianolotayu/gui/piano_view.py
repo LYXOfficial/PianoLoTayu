@@ -67,7 +67,7 @@ def instrument_display_name(inst, index: int) -> str:
 def instrument_program_label(inst) -> str:
     """Human-readable timbre label for a pretty_midi Instrument."""
     if getattr(inst, "is_drum", False):
-        return "Drums (Ch.10)"
+        return "10: Drums"
     prog = int(getattr(inst, "program", 0) or 0)
     try:
         import pretty_midi

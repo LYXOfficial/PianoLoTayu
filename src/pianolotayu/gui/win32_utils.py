@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import ctypes
 import os
+import shutil
 import sys
 from ctypes import wintypes, byref, cast, sizeof, POINTER, c_void_p, c_ulong, c_int
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -21,17 +23,247 @@ from PySide6 import QtWidgets, QtCore, QtGui
 # ═══════════════════════════════════════════════════════════════════════════════
 _IS_WIN32 = sys.platform == "win32"
 
-# Project root icon.png (…/gui/win32_utils.py → parents[3] = repo root)
-_APP_ICON_PATH = Path(__file__).resolve().parents[3] / "icon.png"
+
+def app_base_dirs() -> list[Path]:
+    """Candidate roots for loose data (icon.ico, soundfonts/, fluidsynth/).
+
+    Order matters — first existing hit wins for most callers:
+
+    1. Directory of the running executable (Nuitka/PyInstaller dist folder)
+    2. Current working directory
+    3. Source-tree repo root (…/gui/win32_utils.py → parents[3])
+    4. Ancestors of ``__file__`` (frozen layouts that nest the package)
+    """
+    dirs: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(p: Path | None) -> None:
+        if p is None:
+            return
+        try:
+            key = str(p.resolve())
+        except OSError:
+            key = str(p)
+        if key in seen:
+            return
+        seen.add(key)
+        dirs.append(p)
+
+    # Frozen / Nuitka standalone: data is dropped next to the binary
+    try:
+        _add(Path(sys.executable).resolve().parent)
+    except Exception:
+        pass
+    # PyInstaller onefile extract dir
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        try:
+            _add(Path(sys._MEIPASS))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    try:
+        _add(Path.cwd())
+    except Exception:
+        pass
+    # Dev: repo root (gui → pianolotayu → src → root)
+    here = Path(__file__).resolve()
+    if len(here.parents) > 3:
+        _add(here.parents[3])
+    for parent in here.parents[:6]:
+        _add(parent)
+    return dirs
+
+
+def find_data_file(*relative: str) -> Path | None:
+    """Return the first existing path under :func:`app_base_dirs` / *relative*."""
+    rel = Path(*relative)
+    for base in app_base_dirs():
+        cand = base / rel
+        try:
+            if cand.is_file():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def find_data_dir(*relative: str) -> Path | None:
+    """Return the first existing directory under :func:`app_base_dirs` / *relative*."""
+    rel = Path(*relative)
+    for base in app_base_dirs():
+        cand = base / rel
+        try:
+            if cand.is_dir():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def soundfont_dir() -> Path:
+    """Directory scanned for ``*.sf2`` (may not exist yet — callers glob safely)."""
+    found = find_data_dir("soundfonts")
+    if found is not None:
+        return found
+    # Prefer exe-adjacent path when frozen so users know where to drop fonts
+    try:
+        return Path(sys.executable).resolve().parent / "soundfonts"
+    except Exception:
+        return Path.cwd() / "soundfonts"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ffmpeg discovery (imageio-ffmpeg / dist / PATH) — all platforms
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _looks_like_ffmpeg_name(name: str) -> bool:
+    n = name.lower()
+    return n == "ffmpeg" or n == "ffmpeg.exe" or n.startswith("ffmpeg-")
+
+
+def _is_ffmpeg_candidate(p: Path) -> bool:
+    """Accept real files, symlinks, or launcher scripts named ffmpeg*."""
+    try:
+        if not _looks_like_ffmpeg_name(p.name):
+            return False
+        # is_file() follows symlinks; also allow symlink path itself
+        return p.is_file() or p.is_symlink()
+    except OSError:
+        return False
+
+
+def _find_ffmpeg_in_dir(d: Path) -> Path | None:
+    try:
+        if not d.is_dir():
+            return None
+    except OSError:
+        return None
+    hits: list[Path] = []
+    try:
+        for f in d.iterdir():
+            if _is_ffmpeg_candidate(f):
+                hits.append(f)
+    except OSError:
+        return None
+    if not hits:
+        return None
+    # Prefer larger when several (static build vs tiny wrapper), but no minimum size
+    def _size(p: Path) -> int:
+        try:
+            return p.stat().st_size
+        except OSError:
+            return 0
+    hits.sort(key=_size, reverse=True)
+    return hits[0]
+
+
+def _ffmpeg_search_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    seen: set[str] = set()
+
+    def add(p: Path | None) -> None:
+        if p is None:
+            return
+        try:
+            key = str(p.resolve())
+        except OSError:
+            key = str(p)
+        if key in seen:
+            return
+        seen.add(key)
+        dirs.append(p)
+
+    for base in app_base_dirs():
+        add(base)
+        add(base / "imageio_ffmpeg" / "binaries")
+        add(base / "binaries")
+        add(base / "bin")
+        add(base / "ffmpeg")
+
+    try:
+        import imageio_ffmpeg
+        pkg = Path(imageio_ffmpeg.__file__).resolve().parent
+        add(pkg)
+        add(pkg / "binaries")
+    except Exception:
+        pass
+    try:
+        import importlib.resources as ir
+        ref = ir.files("imageio_ffmpeg.binaries") / "__init__.py"
+        with ir.as_file(ref) as path:
+            add(Path(path).parent)
+    except Exception:
+        pass
+    return dirs
+
+
+@lru_cache(maxsize=1)
+def get_ffmpeg_exe() -> str:
+    """Locate ffmpeg without hardcoding versioned filenames.
+
+    Accepts real binaries, symlinks, or launcher scripts named ``ffmpeg*``.
+    Order: ``IMAGEIO_FFMPEG_EXE`` → dist/package dirs → imageio_ffmpeg → PATH.
+    """
+    env = os.environ.get("IMAGEIO_FFMPEG_EXE", "").strip()
+    if env:
+        ep = Path(env)
+        if ep.exists():
+            return str(ep)
+
+    preferred_name = ""
+    try:
+        from imageio_ffmpeg._definitions import FNAME_PER_PLATFORM, get_platform
+        preferred_name = FNAME_PER_PLATFORM.get(get_platform(), "") or ""
+    except Exception:
+        pass
+
+    for d in _ffmpeg_search_dirs():
+        for search in (d / "binaries", d):
+            if preferred_name:
+                pref = search / preferred_name
+                if _is_ffmpeg_candidate(pref):
+                    try:
+                        return str(pref.resolve())
+                    except OSError:
+                        return str(pref)
+            hit = _find_ffmpeg_in_dir(search)
+            if hit is not None:
+                try:
+                    return str(hit.resolve())
+                except OSError:
+                    return str(hit)
+
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe as _upstream
+        exe = _upstream()
+        if exe and Path(exe).exists():
+            return str(exe)
+    except Exception:
+        pass
+
+    found = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    if found:
+        return found
+
+    tried = "\n".join(f"  · {d}" for d in _ffmpeg_search_dirs()[:12])
+    raise FileNotFoundError(
+        "找不到 ffmpeg。\n"
+        "请将 imageio-ffmpeg 的 binaries 放到程序旁 "
+        "(…/imageio_ffmpeg/binaries/ffmpeg*)，\n"
+        "或设置 IMAGEIO_FFMPEG_EXE=路径（可为脚本/符号链接）。\n"
+        f"已搜索：\n{tried}"
+    )
+
+
 _app_icon_cache: QtGui.QIcon | None = None
 
 
 def app_icon() -> QtGui.QIcon:
-    """Application icon loaded from project-root ``icon.png`` (cached)."""
+    """Application icon from ``icon.ico`` next to the app / repo root (cached)."""
     global _app_icon_cache
     if _app_icon_cache is None:
-        if _APP_ICON_PATH.is_file():
-            _app_icon_cache = QtGui.QIcon(str(_APP_ICON_PATH))
+        path = find_data_file("icon.ico")
+        if path is not None:
+            _app_icon_cache = QtGui.QIcon(str(path))
         else:
             _app_icon_cache = QtGui.QIcon()  # empty fallback
     return _app_icon_cache
@@ -49,6 +281,346 @@ def set_app_user_model_id(app_id: str = "PianoLoTayu") -> None:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
     except Exception:
         pass
+
+
+def attach_parent_console() -> bool:
+    """Reconnect ``sys.stdout`` / ``sys.stderr`` to the parent console if any.
+
+    Nuitka ``--windows-console-mode=attach``:
+      * From cmd/PowerShell → parent console exists → we bind streams to CONOUT$
+      * From Explorer double-click → no parent → AttachConsole fails
+
+    Opening CONOUT$ / fd 1 when there is **no** console yields WinError 6
+    (句柄无效) later on print/flush — which matches "double-click breaks,
+    cmd/attach works, disable works".  So we only rebind when std handles
+    are actually valid; otherwise install a quiet sink.
+    """
+    if not _IS_WIN32:
+        try:
+            return bool(sys.stdout and not getattr(sys.stdout, "closed", True))
+        except Exception:
+            return False
+
+    kernel32 = ctypes.windll.kernel32
+    ATTACH_PARENT_PROCESS = 0xFFFFFFFF  # DWORD(-1)
+    # GetStdHandle returns HANDLE; INVALID_HANDLE_VALUE is (HANDLE)-1
+    INVALID_HANDLE = ctypes.c_void_p(-1).value
+    STD_INPUT_HANDLE = -10
+    STD_OUTPUT_HANDLE = -11
+    STD_ERROR_HANDLE = -12
+
+    def _std_handle_ok(n_std: int) -> bool:
+        try:
+            h = kernel32.GetStdHandle(n_std)
+            if not h or h == INVALID_HANDLE:
+                return False
+            # Reject NULL and pseudo-broken handles
+            return True
+        except Exception:
+            return False
+
+    class _NullIO:
+        """Quiet sink so print/read never touch invalid OS handles.
+
+        Used for stdin/stdout/stderr when there is no console (Explorer
+        double-click under Nuitka ``--windows-console-mode=attach``).
+        """
+        encoding = "utf-8"
+        closed = False
+        name = "<null>"
+        mode = "r+"
+
+        def write(self, _s: str = "") -> int:
+            return 0
+
+        def writelines(self, _lines) -> None:
+            return
+
+        def flush(self) -> None:
+            return
+
+        def isatty(self) -> bool:
+            return False
+
+        def readable(self) -> bool:
+            return True
+
+        def writable(self) -> bool:
+            return True
+
+        def seekable(self) -> bool:
+            return False
+
+        def fileno(self) -> int:
+            raise OSError(9, "no console")
+
+        def reconfigure(self, **_kw) -> None:
+            return
+
+        def read(self, _n: int = -1) -> str:
+            return ""
+
+        def readline(self, _n: int = -1) -> str:
+            return ""
+
+        def readlines(self, _hint: int = -1) -> list:
+            return []
+
+        def __iter__(self):
+            return iter(())
+
+        def close(self) -> None:
+            return
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc) -> None:
+            return
+
+    attached = False
+    try:
+        if kernel32.GetConsoleWindow():
+            attached = True
+        else:
+            # Only attach when a parent console may exist.  Explorer launch:
+            # AttachConsole fails → leave streams alone / null sink.
+            ok = bool(kernel32.AttachConsole(ATTACH_PARENT_PROCESS))
+            if ok and kernel32.GetConsoleWindow():
+                attached = True
+            else:
+                # Ensure we do not keep a half-attached state
+                try:
+                    if kernel32.GetConsoleWindow() == 0:
+                        pass
+                except Exception:
+                    pass
+                attached = False
+    except Exception:
+        attached = False
+
+    if not attached or not _std_handle_ok(STD_OUTPUT_HANDLE):
+        # Double-click / no console: do not open CONOUT$ (→ 句柄无效).
+        # Also null stdin — a broken STD_INPUT_HANDLE is what makes child
+        # CreateProcess / ffmpeg fail with WinError 6 when stdin is inherited.
+        def _replace_if_unusable(name: str) -> None:
+            try:
+                stream = getattr(sys, name, None)
+                usable = False
+                if stream is not None and not getattr(stream, "closed", False):
+                    try:
+                        usable = bool(stream.isatty())
+                    except Exception:
+                        usable = False
+                if not usable:
+                    setattr(sys, name, _NullIO())
+            except Exception:
+                try:
+                    setattr(sys, name, _NullIO())
+                except Exception:
+                    pass
+
+        _replace_if_unusable("stdin")
+        _replace_if_unusable("stdout")
+        _replace_if_unusable("stderr")
+        return False
+
+    def _bind_out(name: str, n_std: int) -> None:
+        stream = getattr(sys, name, None)
+        try:
+            if stream is not None and not stream.closed and stream.isatty():
+                return
+        except Exception:
+            pass
+        if not _std_handle_ok(n_std):
+            setattr(sys, name, _NullIO())
+            return
+        try:
+            f = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+            setattr(sys, name, f)
+            try:
+                f.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        except Exception:
+            setattr(sys, name, _NullIO())
+
+    try:
+        _bind_out("stdout", STD_OUTPUT_HANDLE)
+        _bind_out("stderr", STD_ERROR_HANDLE)
+        return True
+    except Exception:
+        try:
+            sys.stdout = _NullIO()  # type: ignore[assignment]
+            sys.stderr = _NullIO()  # type: ignore[assignment]
+        except Exception:
+            pass
+        return False
+
+
+def log_console(msg: str) -> None:
+    """Best-effort print; never raises (including WinError 6 on bad handles)."""
+    for stream_name in ("stdout", "stderr"):
+        try:
+            stream = getattr(sys, stream_name, None)
+            if stream is None or getattr(stream, "closed", False):
+                continue
+            stream.write(msg + "\n")
+            stream.flush()
+            return
+        except Exception:
+            continue
+
+
+def sanitize_std_handles() -> None:
+    """Point broken STD_* handles at ``NUL`` so child processes can inherit them.
+
+    Explorer / Nuitka GUI launches often leave STD_INPUT_HANDLE (and sometimes
+    OUT/ERR) as INVALID_HANDLE_VALUE.  Python-level ``sys.stdin = NullIO`` does
+    **not** fix that — ``CreateProcess`` inherits the OS handles.  Redirecting
+    invalid ones to ``NUL`` stops WinError 6 (句柄无效) in ffmpeg and friends
+    even when a call site forgets ``stdin=DEVNULL``.
+
+    Safe no-op on non-Windows and when handles are already valid.
+    """
+    if not _IS_WIN32:
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        INVALID_HANDLE = ctypes.c_void_p(-1).value
+        STD_INPUT_HANDLE = -10
+        STD_OUTPUT_HANDLE = -11
+        STD_ERROR_HANDLE = -12
+        GENERIC_READ = 0x80000000
+        GENERIC_WRITE = 0x40000000
+        FILE_SHARE_READ = 0x1
+        FILE_SHARE_WRITE = 0x2
+        OPEN_EXISTING = 3
+
+        # BOOL GetStdHandle / SetStdHandle — declare once
+        try:
+            kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+            kernel32.GetStdHandle.restype = wintypes.HANDLE
+            kernel32.SetStdHandle.argtypes = [wintypes.DWORD, wintypes.HANDLE]
+            kernel32.SetStdHandle.restype = wintypes.BOOL
+            kernel32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+            ]
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+        except Exception:
+            pass
+
+        def _bad(n_std: int) -> bool:
+            try:
+                h = kernel32.GetStdHandle(n_std)
+                return (not h) or (h == INVALID_HANDLE)
+            except Exception:
+                return True
+
+        def _nul(access: int):
+            try:
+                h = kernel32.CreateFileW(
+                    "NUL", access,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    None, OPEN_EXISTING, 0, None,
+                )
+                if not h or h == INVALID_HANDLE:
+                    return None
+                return h
+            except Exception:
+                return None
+
+        if _bad(STD_INPUT_HANDLE):
+            h = _nul(GENERIC_READ)
+            if h is not None:
+                try:
+                    kernel32.SetStdHandle(STD_INPUT_HANDLE, h)
+                except Exception:
+                    pass
+        if _bad(STD_OUTPUT_HANDLE):
+            h = _nul(GENERIC_WRITE)
+            if h is not None:
+                try:
+                    kernel32.SetStdHandle(STD_OUTPUT_HANDLE, h)
+                except Exception:
+                    pass
+        if _bad(STD_ERROR_HANDLE):
+            h = _nul(GENERIC_WRITE)
+            if h is not None:
+                try:
+                    kernel32.SetStdHandle(STD_ERROR_HANDLE, h)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def subprocess_no_window_kwargs() -> dict:
+    """Kwargs so child processes (ffmpeg, …) do not flash a console on Windows.
+
+    Safe empty dict on non-Windows.  Only sets ``creationflags`` / ``startupinfo``
+    — **does not** set stdin/stdout/stderr (callers often pass those as
+    positional-style kwargs *before* ``**this``, and a trailing unpack would
+    overwrite ``stdin=PIPE``).
+
+    For no-console GUI / Nuitka double-click launches, prefer
+    :func:`run_hidden` / :func:`popen_hidden` which also default ``stdin`` to
+    ``DEVNULL`` (inheriting an invalid STD_INPUT_HANDLE → WinError 6 句柄无效).
+
+    ::
+
+        run_hidden(cmd, capture_output=True, text=True)
+        # or, if you must use raw subprocess:
+        subprocess.run(
+            cmd, stdin=subprocess.DEVNULL, capture_output=True,
+            **subprocess_no_window_kwargs(),
+        )
+    """
+    if not _IS_WIN32:
+        return {}
+    import subprocess
+    kw: dict = {}
+    # 0x08000000 == CREATE_NO_WINDOW (also on older Python as constant)
+    flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+    kw["creationflags"] = flags
+    try:
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= int(subprocess.STARTF_USESHOWWINDOW)
+        si.wShowWindow = 0  # SW_HIDE
+        kw["startupinfo"] = si
+    except Exception:
+        pass
+    return kw
+
+
+def merge_subprocess_kwargs(**user_kw) -> dict:
+    """Merge :func:`subprocess_no_window_kwargs` with caller kwargs.
+
+    If the caller did not set ``stdin`` (or set it to ``None``), force
+    ``stdin=DEVNULL``.  Explorer/Nuitka double-click leaves STD_INPUT_HANDLE
+    invalid; children that inherit it fail with WinError 6 (句柄无效).
+    Explicit ``stdin=PIPE`` / a file object is preserved.
+    """
+    import subprocess
+
+    kw = subprocess_no_window_kwargs()
+    kw.update(user_kw)
+    if kw.get("stdin") is None:
+        kw["stdin"] = subprocess.DEVNULL
+    return kw
+
+
+def run_hidden(cmd, **kwargs):
+    """``subprocess.run`` with no-window flags + safe default stdin."""
+    import subprocess
+    return subprocess.run(cmd, **merge_subprocess_kwargs(**kwargs))
+
+
+def popen_hidden(cmd, **kwargs):
+    """``subprocess.Popen`` with no-window flags + safe default stdin."""
+    import subprocess
+    return subprocess.Popen(cmd, **merge_subprocess_kwargs(**kwargs))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -162,6 +734,9 @@ class TaskbarProgress:
         self._fn_set_value: Any = None
         self._fn_set_state: Any = None
         self._current_state: int = TBPF_NOPROGRESS if _IS_WIN32 else 0
+        # Last (completed, total) sent to SetProgressValue — avoid redundant
+        # COM calls that make the Windows taskbar bar stutter / flash.
+        self._last_value: tuple[int, int] | None = None
 
         if _IS_WIN32:
             self._init_com()
@@ -197,39 +772,64 @@ class TaskbarProgress:
     def _call_set_state(self, flags: int) -> None:
         if self._fn_set_state is None:
             return
+        if flags == self._current_state and flags != TBPF_NOPROGRESS:
+            return
         hwnd = self._hwnd()
         if hwnd:
-            self._fn_set_state(self._itaskbar3, hwnd, flags)
+            try:
+                self._fn_set_state(self._itaskbar3, hwnd, flags)
+            except Exception:
+                # HWND/COM can go invalid mid-close; never surface to UI
+                return
         self._current_state = flags
+        if flags == TBPF_NOPROGRESS:
+            self._last_value = None
 
     def _call_set_value(self, completed: int, total: int) -> None:
         if self._fn_set_value is None:
             return
+        completed = max(0, int(completed))
+        total = max(1, int(total))
+        key = (completed, total)
+        if key == self._last_value:
+            return
         hwnd = self._hwnd()
         if hwnd:
-            self._fn_set_value(self._itaskbar3, hwnd,
-                               ctypes.c_ulonglong(completed),
-                               ctypes.c_ulonglong(total))
+            try:
+                self._fn_set_value(
+                    self._itaskbar3, hwnd,
+                    ctypes.c_ulonglong(completed),
+                    ctypes.c_ulonglong(total),
+                )
+            except Exception:
+                return
+        self._last_value = key
 
     # ── Public API ───────────────────────────────────────────────────────
 
     def show_normal(self, value: int, total: int = 100) -> None:
         """Green progress bar at *value* / *total*."""
-        self._call_set_state(TBPF_NORMAL)
+        # Set value first when already NORMAL so Windows animates the fill
+        # without a state-reset flash each tick.
+        if self._current_state != TBPF_NORMAL:
+            self._call_set_state(TBPF_NORMAL)
         self._call_set_value(value, total)
 
     def show_paused(self, value: int, total: int = 100) -> None:
         """Yellow progress bar at *value* / *total*."""
-        self._call_set_state(TBPF_PAUSED)
+        if self._current_state != TBPF_PAUSED:
+            self._call_set_state(TBPF_PAUSED)
         self._call_set_value(value, total)
 
     def show_error(self, value: int, total: int = 100) -> None:
         """Red progress bar at *value* / *total*."""
-        self._call_set_state(TBPF_ERROR)
+        if self._current_state != TBPF_ERROR:
+            self._call_set_state(TBPF_ERROR)
         self._call_set_value(value, total)
 
     def show_indeterminate(self) -> None:
         """Spinning (marquee) green bar — use when total is unknown."""
+        self._last_value = None
         self._call_set_state(TBPF_INDETERMINATE)
 
     def hide(self) -> None:

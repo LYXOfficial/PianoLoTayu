@@ -24,8 +24,8 @@ class Ui_Form(object):
     def setupUi(self, Form):
         if not Form.objectName():
             Form.setObjectName(u"Form")
-        Form.resize(480, 490)
-        Form.setMinimumSize(QSize(480, 490))
+        Form.resize(500, 0)
+        Form.setMinimumSize(QSize(500, 0))
         self.gridLayout = QGridLayout(Form)
         self.gridLayout.setObjectName(u"gridLayout")
         self.horizontalLayout_4 = QHBoxLayout()
