@@ -286,7 +286,7 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(
                 self, "提示", "MIDI 文件尚未生成，请先点击「开始转换」。")
             return
-        from .piano_roll import PianoRollWindow
+        from .view_window import PianoRollWindow
         self._preview_win = PianoRollWindow(str(self._output_path))
         self._preview_win.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
         self._preview_win.show()
