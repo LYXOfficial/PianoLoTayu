@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6 import QtWidgets, QtGui, QtCore
@@ -17,6 +18,78 @@ _NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 def _midi_note_name(pitch: int) -> str:
     """MIDI note number → name like ``C4`` (same as pretty_midi)."""
     return f"{_NOTE_NAMES[pitch % 12]}{pitch // 12 - 1}"
+
+
+@dataclass
+class PlaybackOptions:
+    """Shared play / export / roll-view options.
+
+    Defaults match historical behaviour: piano-range only for audio, all piano
+    timbre, drums muted (hidden), other tracks enabled (shown).
+    ``track_enabled`` controls both audio mute and roll/export-video visibility.
+    """
+    # Play notes outside A0–C8 (audio only — roll still draws 21–108)
+    play_out_of_range: bool = False
+    # Use each track's GM program instead of forcing piano
+    use_track_programs: bool = False
+    # inst_idx → enabled for audio + roll/export-video visibility.
+    # None means "default: enable non-drums"
+    track_enabled: dict[int, bool] | None = None
+
+    def is_track_enabled(self, inst_idx: int, is_drum: bool) -> bool:
+        if self.track_enabled is not None and inst_idx in self.track_enabled:
+            return bool(self.track_enabled[inst_idx])
+        return not is_drum
+
+    def pitch_ok(self, pitch: int) -> bool:
+        if self.play_out_of_range:
+            return 0 <= pitch <= 127
+        return MIN_PITCH <= pitch <= MAX_PITCH
+
+
+def default_track_enabled(midi) -> dict[int, bool]:
+    """Default mute map: drums off, everything else on."""
+    out: dict[int, bool] = {}
+    if midi is None:
+        return out
+    for i, inst in enumerate(midi.instruments):
+        out[i] = not bool(inst.is_drum)
+    return out
+
+
+def instrument_display_name(inst, index: int) -> str:
+    name = (getattr(inst, "name", None) or "").strip()
+    if name:
+        return name
+    return f"Track {index + 1}"
+
+
+def instrument_program_label(inst) -> str:
+    """Human-readable timbre label for a pretty_midi Instrument."""
+    if getattr(inst, "is_drum", False):
+        return "Drums (Ch.10)"
+    prog = int(getattr(inst, "program", 0) or 0)
+    try:
+        import pretty_midi
+        return f"{prog}: {pretty_midi.program_to_instrument_name(prog)}"
+    except Exception:
+        return f"Program {prog}"
+
+
+def list_track_infos(midi) -> list[dict]:
+    """Summaries for the playback-options dialog."""
+    rows: list[dict] = []
+    if midi is None:
+        return rows
+    for i, inst in enumerate(midi.instruments):
+        rows.append({
+            "index": i,
+            "name": instrument_display_name(inst, i),
+            "program": instrument_program_label(inst),
+            "n_notes": len(getattr(inst, "notes", []) or []),
+            "is_drum": bool(inst.is_drum),
+        })
+    return rows
 
 
 def load_pretty_midi(midi_path: str | Path):
@@ -300,6 +373,8 @@ class GridScene(QtWidgets.QGraphicsScene):
         self._trail_pad = 200
         # Shared
         self._mono: QtGui.QColor | None = None
+        # Track visibility (same map as PlaybackOptions.track_enabled)
+        self._track_enabled: dict[int, bool] | None = None
         # key: (pitch, start, inst_idx) — keeps multi-track / double notes distinct
         self._note_items: dict[tuple[int, float, int], tuple[QtWidgets.QGraphicsRectItem, int]] = {}
         self._active_keys: set[tuple[int, float, int]] = set()
@@ -309,6 +384,18 @@ class GridScene(QtWidgets.QGraphicsScene):
         self._mono = QtGui.QColor(hex_color) if hex_color else None
         if self._midi is not None:
             self._rebuild()
+
+    def set_track_enabled(self, track_enabled: dict[int, bool] | None) -> None:
+        """Show/hide notes per instrument index (None = default: hide drums)."""
+        self._track_enabled = track_enabled
+        if self._midi is not None:
+            # Notes only — grid geometry unchanged
+            self._redraw_notes()
+
+    def _track_visible(self, inst_idx: int, is_drum: bool) -> bool:
+        if self._track_enabled is not None and inst_idx in self._track_enabled:
+            return bool(self._track_enabled[inst_idx])
+        return not is_drum
 
     def set_orientation(self, vertical: bool) -> None:
         if self._vertical == vertical:
@@ -333,6 +420,15 @@ class GridScene(QtWidgets.QGraphicsScene):
         self._midi = load_pretty_midi(midi_path)
         self._rebuild()
 
+    def _redraw_notes(self) -> None:
+        """Drop and re-add note rects without rebuilding the grid."""
+        for item, _alpha in self._note_items.values():
+            self.removeItem(item)
+        self._note_items.clear()
+        self._active_keys.clear()
+        if self._midi is not None:
+            self._draw_notes()
+
     def _rebuild(self) -> None:
         self.clear()
         self._note_items.clear()
@@ -355,28 +451,58 @@ class GridScene(QtWidgets.QGraphicsScene):
     def set_trail_pad(self, pad: float) -> None:
         """Set trailing empty time padding (canonical px after last note).
 
-        Horizontal mode only expands the scene rect (notes don't depend on pad).
-        Vertical mode must rebuild because note Y positions use ``_time_base``.
+        Never rebuilds the whole note graph — that made vertical zoom stutter.
+        Updates scene rect + stretches grid geometry; shifts note items in
+        vertical mode so their time mapping stays correct.
         """
         pad = max(200.0, float(pad))
-        if abs(pad - self._trail_pad) < 1.0:
+        old = float(self._trail_pad)
+        if abs(pad - old) < 1.0:
             return
         self._trail_pad = pad
         if self._midi is None:
             return
+        dur = self.scene_duration_s()
         if self._vertical:
-            self._rebuild()
+            # Notes: y = time_base - t*C  → when pad grows, time_base grows;
+            # shift notes down by delta so each note keeps its absolute time.
+            delta = pad - old
+            total = MAX_PITCH - MIN_PITCH + 1
+            tw = total * self._note_w + self._extra_w
+            th = dur * self._CANONICAL_PX + pad
+            self._time_base = th
+            for item in self.items():
+                z = item.zValue()
+                if z >= 5:
+                    # note rects
+                    if abs(delta) >= 1.0:
+                        item.moveBy(0.0, delta)
+                elif z <= 0:
+                    # grid fill / column lines — cover full new height
+                    if isinstance(item, QtWidgets.QGraphicsRectItem):
+                        r = item.rect()
+                        item.setRect(r.x(), 0.0, r.width(), th)
+                    elif isinstance(item, QtWidgets.QGraphicsLineItem):
+                        ln = item.line()
+                        item.setLine(ln.x1(), 0.0, ln.x2(), th)
+            self.setSceneRect(0, 0, tw, th)
         else:
-            # Cheap: widen scene only — note X = t * CANONICAL, independent of pad
-            dur = self.scene_duration_s()
             tw = dur * self._CANONICAL_PX + pad
             th = self.sceneRect().height()
             if th <= 0:
                 total = MAX_PITCH - MIN_PITCH + 1
                 th = total * self._note_h + self._extra
+            for item in self.items():
+                if item.zValue() > 0:
+                    continue  # notes: X = t*C, independent of pad
+                if isinstance(item, QtWidgets.QGraphicsRectItem):
+                    r = item.rect()
+                    item.setRect(0.0, r.y(), tw, r.height())
+                elif isinstance(item, QtWidgets.QGraphicsLineItem):
+                    ln = item.line()
+                    # horizontal pitch separators
+                    item.setLine(0.0, ln.y1(), tw, ln.y2())
             self.setSceneRect(0, 0, tw, th)
-            # Extend grid stripe width if we already drew a shorter grid
-            # (background brush covers the rest; optional lines stop early — OK)
 
     def scene_duration_s(self) -> float:
         return self._midi.get_end_time() if self._midi else 0.0
@@ -441,23 +567,19 @@ class GridScene(QtWidgets.QGraphicsScene):
     def _draw_notes(self) -> None:
         if self._midi is None:
             return
-        # Count notes sharing (pitch, start) so multi-track unisons can be offset
-        same_start: dict[tuple[int, float], int] = {}
+        # Draw every visible note at its true pitch row/column — no stack
+        # offset.  Multi-track unisons sit on top of each other (same as
+        # export video); shifting them made chords look crooked.
         if self._vertical:
             for inst_i, inst in enumerate(self._midi.instruments):
-                if inst.is_drum:
+                if not self._track_visible(inst_i, bool(inst.is_drum)):
                     continue
                 for note in inst.notes:
                     if note.pitch < MIN_PITCH or note.pitch > MAX_PITCH:
                         continue
                     col_w = self.pitch_width(note.pitch)
-                    base_x = self.pitch_to_x(note.pitch) + max(1, col_w // 8)
+                    x = self.pitch_to_x(note.pitch) + max(1, col_w // 8)
                     w = max(2, col_w - max(2, col_w // 6))
-                    # Offset stacked unisons slightly so all stay visible
-                    k0 = (note.pitch, note.start)
-                    stack = same_start.get(k0, 0)
-                    same_start[k0] = stack + 1
-                    x = base_x + min(stack, 3) * max(1, col_w // 10)
                     y_top = self.time_to_y(note.end)     # later → higher
                     y_bot = self.time_to_y(note.start)   # earlier → lower
                     y = y_top
@@ -471,12 +593,12 @@ class GridScene(QtWidgets.QGraphicsScene):
                     r = self.addRect(x, y, w, h,
                                      QtGui.QPen(color.darker(120), 1),
                                      QtGui.QBrush(color))
-                    r.setZValue(5 + stack)
+                    r.setZValue(5)
                     self._note_items[(note.pitch, note.start, inst_i)] = (r, alpha)
         else:
             note_h, extra = self._note_h, self._extra
             for inst_i, inst in enumerate(self._midi.instruments):
-                if inst.is_drum:
+                if not self._track_visible(inst_i, bool(inst.is_drum)):
                     continue
                 for note in inst.notes:
                     if note.pitch < MIN_PITCH or note.pitch > MAX_PITCH:
@@ -484,12 +606,8 @@ class GridScene(QtWidgets.QGraphicsScene):
                     x = self.time_to_x(note.start)
                     w = max(3.0, self.time_to_x(note.end) - x)
                     row_h = _dist_h(note.pitch, note_h, extra)
-                    base_y = _dist_y(note.pitch, note_h, extra) + max(1, row_h // 8)
+                    y = _dist_y(note.pitch, note_h, extra) + max(1, row_h // 8)
                     h = max(2, row_h - max(2, row_h // 6))
-                    k0 = (note.pitch, note.start)
-                    stack = same_start.get(k0, 0)
-                    same_start[k0] = stack + 1
-                    y = base_y + min(stack, 3) * max(1, row_h // 8)
                     alpha = int(80 + note.velocity / 127 * 175)
                     if self._mono:
                         color = QtGui.QColor(self._mono)
@@ -499,7 +617,7 @@ class GridScene(QtWidgets.QGraphicsScene):
                     r = self.addRect(x, y, w, h,
                                      QtGui.QPen(color.darker(120), 1),
                                      QtGui.QBrush(color))
-                    r.setZValue(5 + stack)
+                    r.setZValue(5)
                     self._note_items[(note.pitch, note.start, inst_i)] = (r, alpha)
 
     def set_active_notes(self, notes: list) -> None:
@@ -551,6 +669,8 @@ class NoteGridView(QtWidgets.QGraphicsView):
 
     vertical_offset_changed = QtCore.Signal(int)
     horizontal_offset_changed = QtCore.Signal(int)
+    # +1 = zoom in (more px/s), -1 = zoom out — same axis as the h_zoom slider
+    zoom_delta = QtCore.Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -570,6 +690,33 @@ class NoteGridView(QtWidgets.QGraphicsView):
             QtWidgets.QSizePolicy.Policy.Expanding,
         )
         self._display_px_per_sec = GridScene._CANONICAL_PX
+        # Enable wheel events on the viewport for Ctrl+scroll zoom
+        self.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if (obj is self.viewport()
+                and event.type() == QtCore.QEvent.Type.Wheel):
+            return self._handle_wheel(event)  # type: ignore[arg-type]
+        return super().eventFilter(obj, event)
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        if self._handle_wheel(event):
+            return
+        super().wheelEvent(event)
+
+    def _handle_wheel(self, event: QtGui.QWheelEvent) -> bool:
+        """Ctrl+wheel → zoom signal (same as h_zoom slider). Returns True if handled."""
+        mods = event.modifiers()
+        if not (mods & QtCore.Qt.KeyboardModifier.ControlModifier):
+            return False
+        dy = event.angleDelta().y()
+        if dy == 0:
+            dy = event.pixelDelta().y()
+        if dy == 0:
+            return True  # eat event, no step
+        self.zoom_delta.emit(1 if dy > 0 else -1)
+        event.accept()
+        return True
 
     def load(self, midi_path: str | Path) -> None:
         self._scene.load(midi_path)
@@ -582,17 +729,22 @@ class NoteGridView(QtWidgets.QGraphicsView):
             t = self._view_y_to_time(self.verticalScrollBar().value())
         else:
             t = self.x_to_time(self.horizontalScrollBar().value())
-        # Apply new zoom
+        # Apply new zoom (cheap QTransform only)
         self._display_px_per_sec = px_per_sec
         scale = px_per_sec / GridScene._CANONICAL_PX
         if self._scene._vertical:
             self.setTransform(QtGui.QTransform.fromScale(1.0, scale))
         else:
             self.setTransform(QtGui.QTransform.fromScale(scale, 1.0))
-        # Trailing pad depends on zoom (visible scene span changes)
+        # Adjust trailing pad without rebuilding notes
         self.ensure_trail_pad()
-        # Restore scroll so the same time stays at the same viewport position
-        self.scroll_to_time(t)
+        # Restore scroll (don't call scroll_to_time → would re-enter ensure_trail_pad)
+        if self._scene._vertical:
+            view_y = self._view_time_to_y(t)
+            vp_h = self.viewport().height()
+            self.verticalScrollBar().setValue(max(0, int(view_y - vp_h)))
+        else:
+            self.horizontalScrollBar().setValue(int(self.time_to_x(t)))
 
     def set_v_zoom(self, note_h: int, extra: int = 0) -> None:
         self._scene.set_v_zoom(note_h, extra)
@@ -615,6 +767,10 @@ class NoteGridView(QtWidgets.QGraphicsView):
 
     def set_mono(self, hex_color: str | None) -> None:
         self._scene.set_mono(hex_color)
+
+    def set_track_enabled(self, track_enabled: dict[int, bool] | None) -> None:
+        """Show/hide notes per instrument (sync with playback options)."""
+        self._scene.set_track_enabled(track_enabled)
 
     def scene_duration_s(self) -> float:
         return self._scene.scene_duration_s()
@@ -642,12 +798,17 @@ class NoteGridView(QtWidgets.QGraphicsView):
         if scale <= 0:
             return
         if self._scene._vertical:
-            # Need y(duration)=pad such that pad*scale >= viewport height
             vp = max(1, self.viewport().height())
         else:
             vp = max(1, self.viewport().width())
-        # +64 margin so the last notes aren't glued to the edge
+        # +64 margin; quantize to 256-px steps so tiny zoom changes don't thrash
         needed = vp / scale + 64.0
+        step = 256.0
+        needed = max(200.0, (int(needed / step) + 1) * step)
+        cur = float(self._scene._trail_pad)
+        # Only grow, or shrink when more than 2× oversized (avoid chatter)
+        if needed <= cur and needed > cur * 0.5:
+            return
         self._scene.set_trail_pad(needed)
 
     # ── View-level time ↔ pixel helpers (account for QTransform) ─────
@@ -664,7 +825,8 @@ class NoteGridView(QtWidgets.QGraphicsView):
         return (self._scene._time_base - canonical_y) / GridScene._CANONICAL_PX
 
     def scroll_to_time(self, t: float) -> None:
-        self.ensure_trail_pad()
+        # No ensure_trail_pad here — called every playback tick; pad is sized
+        # on zoom/resize only.
         if self._scene._vertical:
             view_y = self._view_time_to_y(t)
             vp_h = self.viewport().height()
@@ -748,8 +910,24 @@ class MidiPlayer(QtCore.QObject):
         self._pause_pos = 0.0
         # Active note instances: (pitch, start, inst_idx) → (channel, velocity)
         self._active: dict[tuple[int, float, int], tuple[int, int]] = {}
-        # inst_idx → fluidsynth channel (0–15, skip 9 = drums)
+        # inst_idx → fluidsynth channel (0–15, skip 9 = drums when not drums)
         self._inst_ch: dict[int, int] = {}
+        self._options = PlaybackOptions()
+
+    def set_playback_options(self, options: PlaybackOptions) -> None:
+        """Apply options; re-map channels/programs. Safe while paused/stopped."""
+        self._options = options or PlaybackOptions()
+        self._assign_channels()
+        if self._synth is not None:
+            try:
+                self._synth.all_sounds_off(-1)
+            except Exception:
+                pass
+            self._assign_programs()
+        self._active = {}
+
+    def playback_options(self) -> PlaybackOptions:
+        return self._options
 
     def unload_soundfont(self) -> None:
         """Mute and release the synth (silent / no-SoundFont mode)."""
@@ -839,14 +1017,21 @@ class MidiPlayer(QtCore.QObject):
             return False
 
     def _assign_channels(self) -> None:
-        """Map each non-drum instrument to a fluidsynth melodic channel."""
+        """Map each *enabled* instrument to a fluidsynth channel.
+
+        Drums use channel 9 when enabled; melodic tracks use 0–8,10–15.
+        Disabled tracks get no channel (skipped at note time).
+        """
         self._inst_ch = {}
         ch = 0
         if self._midi is None:
             return
+        opt = self._options
         for i, inst in enumerate(self._midi.instruments):
+            if not opt.is_track_enabled(i, bool(inst.is_drum)):
+                continue
             if inst.is_drum:
-                self._inst_ch[i] = 9  # GM drum channel (unused if we skip drums)
+                self._inst_ch[i] = 9
                 continue
             if ch == 9:
                 ch = 10
@@ -856,25 +1041,52 @@ class MidiPlayer(QtCore.QObject):
             ch += 1
 
     def _assign_programs(self) -> None:
-        """Select piano (GM program 0) on every melodic channel we use.
-
-        Drum tracks are never played; all other tracks share the piano
-        timbre so multi-track MIDI still reads as a piano arrangement.
-        """
+        """Select timbre per channel: piano (default) or each track's GM program."""
         if self._synth is None or self._sfid < 0:
             return
         if not self._inst_ch:
             self._assign_channels()
-        # Piano on every assigned melodic channel (+ ch 0 as default)
-        channels = {0, *self._inst_ch.values()} - {9}
-        for ch in channels:
+        # Default piano on ch 0
+        try:
+            self._synth.program_select(0, self._sfid, 0, 0)
+        except Exception:
+            pass
+        if self._midi is None:
+            return
+        use_prog = self._options.use_track_programs
+        for i, inst in enumerate(self._midi.instruments):
+            if i not in self._inst_ch:
+                continue
+            ch = self._inst_ch[i]
+            if inst.is_drum:
+                # Standard drum kit on bank 128 / channel 9 — try bank 128
+                try:
+                    self._synth.program_select(ch, self._sfid, 128, 0)
+                except Exception:
+                    try:
+                        self._synth.program_select(ch, self._sfid, 0, 0)
+                    except Exception:
+                        pass
+                continue
+            prog = int(getattr(inst, "program", 0) or 0) if use_prog else 0
             try:
-                self._synth.program_select(ch, self._sfid, 0, 0)
+                self._synth.program_select(ch, self._sfid, 0, prog)
             except Exception:
-                pass
+                try:
+                    self._synth.program_select(ch, self._sfid, 0, 0)
+                except Exception:
+                    pass
 
     def load_midi(self, midi_path: str | Path) -> None:
         self._midi = load_pretty_midi(midi_path)
+        # Seed default track mute map if none set yet
+        if self._options.track_enabled is None:
+            self._options.track_enabled = default_track_enabled(self._midi)
+        else:
+            # Keep existing choices; add defaults for new indices
+            defaults = default_track_enabled(self._midi)
+            for i, en in defaults.items():
+                self._options.track_enabled.setdefault(i, en)
         self._assign_channels()
         if self._synth is not None:
             self._assign_programs()
@@ -883,6 +1095,9 @@ class MidiPlayer(QtCore.QObject):
         if sf_path:
             if self._synth is None and not self.load_soundfont(sf_path):
                 return
+            # Re-apply programs in case options changed while silent
+            self._assign_channels()
+            self._assign_programs()
         else:
             self.unload_soundfont()
         if start_t is not None:
@@ -936,12 +1151,15 @@ class MidiPlayer(QtCore.QObject):
         out: dict[tuple[int, float, int], tuple[int, int]] = {}
         if self._midi is None:
             return out
+        opt = self._options
         for inst_i, inst in enumerate(self._midi.instruments):
-            if inst.is_drum:
+            if not opt.is_track_enabled(inst_i, bool(inst.is_drum)):
                 continue
-            ch = self._inst_ch.get(inst_i, 0)
+            if inst_i not in self._inst_ch:
+                continue
+            ch = self._inst_ch[inst_i]
             for note in inst.notes:
-                if note.pitch < MIN_PITCH or note.pitch > MAX_PITCH:
+                if not opt.pitch_ok(note.pitch):
                     continue
                 if note.start <= now < note.end:
                     key = (note.pitch, note.start, inst_i)

@@ -69,8 +69,8 @@ class Ui_Form(object):
         self.horizontalLayout.setObjectName(u"horizontalLayout")
         self.filePathEdit = QLineEdit(Form)
         self.filePathEdit.setObjectName(u"filePathEdit")
-        self.filePathEdit.setMinimumSize(QSize(0, 32))
-        self.filePathEdit.setMaximumSize(QSize(16777215, 32))
+        self.filePathEdit.setMinimumSize(QSize(0, 0))
+        self.filePathEdit.setMaximumSize(QSize(16777215, 16777215))
 
         self.horizontalLayout.addWidget(self.filePathEdit)
 

@@ -30,7 +30,8 @@ from .ui_main import Ui_Form
 from .drop_label import DropLabel
 from .win32_utils import (
     TaskbarProgress, BeepSuppressor, app_icon, set_app_user_model_id,
-    enable_elevated_file_drop,
+    enable_elevated_file_drop, reassert_elevated_file_drop,
+    prepare_elevated_drop_filters, is_process_elevated,
 )
 from ..config import DEFAULTS, VERSION
 import traceback
@@ -196,6 +197,7 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
         self._worker: ConversionWorker | None = None
         self._taskbar = TaskbarProgress(self)
         self._elevated_drop_filter = None  # keep alive for WM_DROPFILES
+        self._elevated_drag_poll: QtCore.QTimer | None = None
         self._init_drop_area()
         self._init_io()
         self._init_convert()
@@ -203,18 +205,109 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
-        # HWND exists after first show — enable admin←Explorer file drops
+        # HWND exists after first show — enable admin←Explorer file drops.
+        # Re-assert every show: Qt can re-RegisterDragDrop after the first paint.
         if self._elevated_drop_filter is None:
-            def _on_elevated_drop(paths: list[str]) -> None:
+            def _on_elevated_drop(
+                paths: list[str],
+                client_pt: tuple[int, int] | None = None,
+            ) -> None:
+                # WM_DROPFILES is registered on the whole top-level HWND —
+                # only accept when the drop lands on the drop-target box.
+                if not self._is_over_drop_area(client_pt):
+                    try:
+                        self.drop_area.set_external_drag(False)
+                    except Exception:
+                        pass
+                    return
                 ok = [
                     p for p in paths
                     if Path(p).suffix.lower() in DropLabel.SUPPORTED_SUFFIXES
                 ]
+                # Clear drag highlight + brief depth flash (no OLE dragLeave)
+                try:
+                    self.drop_area.set_external_drag(False)
+                    if ok:
+                        self.drop_area.pulse_drop_feedback()
+                except Exception:
+                    pass
                 if ok:
                     self._on_files_selected(ok)
             self._elevated_drop_filter = enable_elevated_file_drop(
                 self, _on_elevated_drop,
             )
+            # When elevated, OLE is revoked — DropLabel's Qt drag events won't
+            # fire.  Delayed re-assert catches Qt re-registering OLE after the
+            # first paint/layout pass.  Poll cursor for drag-depth animation.
+            if is_process_elevated() and self._elevated_drop_filter is not None:
+                QtCore.QTimer.singleShot(
+                    0, lambda: reassert_elevated_file_drop(self),
+                )
+                QtCore.QTimer.singleShot(
+                    200, lambda: reassert_elevated_file_drop(self),
+                )
+                self._start_elevated_drag_poll()
+        else:
+            reassert_elevated_file_drop(self)
+
+    def _is_over_drop_area(
+        self, client_pt: tuple[int, int] | None = None,
+    ) -> bool:
+        """True if *client_pt* (top-level client coords) or the cursor is
+        inside the dashed drop box — nowhere else on the window counts."""
+        area = getattr(self, "drop_area", None)
+        if area is None:
+            return False
+        if client_pt is not None:
+            # DragQueryPoint → coords relative to the window that got WM_DROPFILES
+            global_pos = self.mapToGlobal(
+                QtCore.QPoint(int(client_pt[0]), int(client_pt[1])),
+            )
+        else:
+            global_pos = QtGui.QCursor.pos()
+        local = area.mapFromGlobal(global_pos)
+        return area.rect().contains(local)
+
+    def _start_elevated_drag_poll(self) -> None:
+        """Poll LMB + cursor over drop area → DRAG depth (elevated / no OLE)."""
+        if self._elevated_drag_poll is not None:
+            return
+        timer = QtCore.QTimer(self)
+        timer.setInterval(33)  # ~30 Hz — smooth enough for the fill animation
+
+        def _tick() -> None:
+            area = getattr(self, "drop_area", None)
+            if area is None:
+                return
+            # Physical LMB: Explorer holds capture so QApplication.mouseButtons
+            # is often empty during shell drags.
+            lmb = False
+            try:
+                import sys
+                if sys.platform == "win32":
+                    import ctypes
+                    # VK_LBUTTON = 0x01; high bit set while pressed
+                    lmb = bool(
+                        ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000
+                    )
+                else:
+                    lmb = bool(
+                        QtWidgets.QApplication.mouseButtons()
+                        & QtCore.Qt.MouseButton.LeftButton
+                    )
+            except Exception:
+                lmb = bool(
+                    QtWidgets.QApplication.mouseButtons()
+                    & QtCore.Qt.MouseButton.LeftButton
+                )
+            over = self._is_over_drop_area()
+            # Only highlight when LMB is down *and* cursor is over the box
+            # (same visual as OLE dragEnter).  Outside the box = no effect.
+            area.set_external_drag(lmb and over)
+
+        timer.timeout.connect(_tick)
+        timer.start()
+        self._elevated_drag_poll = timer
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self._worker is not None:
@@ -489,6 +582,8 @@ def main() -> int:
 
     # Windows: own taskbar identity (must be before QApplication)
     set_app_user_model_id("PianoLoTayu")
+    # Windows: UIPI message filter so elevated process can receive Explorer drops
+    prepare_elevated_drop_filters()
 
     # Register fluidsynth DLL dir *before* any import of pyfluidsynth.
     # Must run early so PATH / add_dll_directory are in place.
