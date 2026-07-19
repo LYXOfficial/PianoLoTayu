@@ -465,6 +465,8 @@ def main() -> int:
     import signal
 
     app = QtWidgets.QApplication()
+    app.setApplicationName("PianoLoTayu")
+    app.setOrganizationName("PianoLoTayu")
 
     # ── Suppress Windows beep when clicking outside a modal dialog ────────
     app.installNativeEventFilter(BeepSuppressor())
