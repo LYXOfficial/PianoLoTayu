@@ -847,6 +847,7 @@ class VideoExportWorker(QtCore.QThread):
                     codec=self._v_codec, quality=None, bitrate=self._v_br,
                     pixelformat="yuv420p",
                     output_params=["-threads", "0"],
+                    macro_block_size=1,
                 )
 
             # ── Colour helper (mono or per-pitch) ────────────────────────────
@@ -855,14 +856,6 @@ class VideoExportWorker(QtCore.QThread):
                     r, g, b = self._mono_rgb
                     return QtGui.QColor(r, g, b)
                 return QtGui.QColor(_note_color(pitch))
-
-            print(f"[DEBUG] run(): _mono_rgb={self._mono_rgb}", flush=True)
-            if self._mono_rgb is not None:
-                r, g, b = self._mono_rgb
-                print(f"[DEBUG] run(): mono ON — using RGB({r},{g},{b}) "
-                      f"hex=#{r:02x}{g:02x}{b:02x}", flush=True)
-            else:
-                print(f"[DEBUG] run(): mono OFF — using per-pitch colors", flush=True)
 
             # ── Pre-render static base image (keyboard + grid backgrounds) ──
             base_img = QtGui.QImage(self._w, self._h,
@@ -910,10 +903,11 @@ class VideoExportWorker(QtCore.QThread):
                     if pitch % 12 == 0:
                         name = pretty_midi.note_number_to_name(pitch)
                         bp.setPen(QtGui.QColor(120, 120, 120))
-                        font_sz = max(5, min(7, col_w - 2))
+                        font_sz = max(4, min(8, note_w_col // 2))
                         bp.setFont(QtGui.QFont("sans-serif", font_sz))
                         bp.drawText(
-                            QtCore.QRectF(kx, grid_h + key_h - 14, col_w, 12),
+                            QtCore.QRectF(kx, grid_h + key_h * 3 // 5, col_w,
+                                          max(4, key_h * 2 // 5 - 2)),
                             QtCore.Qt.AlignmentFlag.AlignCenter
                             | QtCore.Qt.TextFlag.TextSingleLine, name)
             else:
@@ -937,7 +931,7 @@ class VideoExportWorker(QtCore.QThread):
                     if pitch % 12 == 0:
                         name = pretty_midi.note_number_to_name(pitch)
                         bp.setPen(QtGui.QColor(120, 120, 120))
-                        font_sz = max(5, min(8, row_h_k - 3))
+                        font_sz = max(4, min(7, note_h, key_w // 3))
                         bp.setFont(QtGui.QFont("sans-serif", font_sz))
                         bp.drawText(
                             QtCore.QRectF(2, ky, key_w - 4, row_h_k),
@@ -989,30 +983,15 @@ class VideoExportWorker(QtCore.QThread):
                         (pitch, start, end, vel, x, w, ny, nh, alpha, color))
 
             # ── Frame loop ──────────────────────────────────────────────────
-            import sys
             if note_draw_cache:
                 first = note_draw_cache[0]
                 c = first[9]  # color is at index 9
-                print(f"[DEBUG] note_draw_cache[0]: pitch={first[0]} "
-                      f"color=({c.red()},{c.green()},{c.blue()}) "
-                      f"alpha={c.alpha()} hex=#{c.red():02x}{c.green():02x}"
-                      f"{c.blue():02x}", flush=True)
-                # Print a few more to see variety
-                for k in range(min(5, len(note_draw_cache))):
-                    ck = note_draw_cache[k][9]
-                    print(f"[DEBUG]   [{k}] pitch={note_draw_cache[k][0]} "
-                          f"rgb=({ck.red()},{ck.green()},{ck.blue()})", flush=True)
             px_per_s = 200  # canonical px/s
 
             for i in range(total_frames):
                 if self.isInterruptionRequested():
                     return
                 t = i / self._fps
-                if i == 0:
-                    import sys
-                    print(f"[DEBUG] Frame 0 start, note_draw_cache size="
-                          f"{len(note_draw_cache)}, note_idx_start={note_idx_start}",
-                          flush=True)
 
                 # Copy static base (keyboard + grid) — 8 MB memcpy
                 frame_img = base_img.copy()
@@ -1020,13 +999,6 @@ class VideoExportWorker(QtCore.QThread):
                 painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
 
                 if self._vertical:
-                    # Print first visible note color for debugging
-                    if i == 0:
-                        for jj in range(note_idx_start, min(note_idx_start + 3, len(note_draw_cache))):
-                            cc = note_draw_cache[jj][9]
-                            print(f"[DEBUG] Frame0 vertical note[{jj}]: "
-                                  f"rgb=({cc.red()},{cc.green()},{cc.blue()}) "
-                                  f"alpha={cc.alpha()}", flush=True)
                     # ── Vertical waterfall: future notes at top ↓ ─────────
                     # screen_y = 0  → time = t+grid_h/px_per_s (top)
                     # screen_y = grid_h → time = t        (keyboard, now)
@@ -1077,11 +1049,11 @@ class VideoExportWorker(QtCore.QThread):
                             if pitch % 12 == 0:
                                 name = pretty_midi.note_number_to_name(pitch)
                                 painter.setPen(QtGui.QColor(255, 255, 255))
-                                font_sz = max(5, min(7, col_w - 2))
+                                font_sz = max(4, min(8, note_w_col // 2))
                                 painter.setFont(QtGui.QFont("sans-serif", font_sz))
                                 painter.drawText(
-                                    QtCore.QRectF(kx, grid_h + key_h - 14,
-                                                  col_w, 12),
+                                    QtCore.QRectF(kx, grid_h + key_h * 3 // 5,
+                                                  col_w, max(4, key_h * 2 // 5 - 2)),
                                     QtCore.Qt.AlignmentFlag.AlignCenter
                                     | QtCore.Qt.TextFlag.TextSingleLine, name)
                         else:
@@ -1158,7 +1130,7 @@ class VideoExportWorker(QtCore.QThread):
                             if pitch % 12 == 0:
                                 name = pretty_midi.note_number_to_name(pitch)
                                 painter.setPen(QtGui.QColor(255, 255, 255))
-                                font_sz = max(5, min(8, row_h_k - 3))
+                                font_sz = max(4, min(7, note_h, key_w // 3))
                                 painter.setFont(
                                     QtGui.QFont("sans-serif", font_sz))
                                 painter.drawText(
@@ -1204,10 +1176,10 @@ class VideoExportWorker(QtCore.QThread):
                 else:
                     writer.append_data(arr[..., :3])
 
-                # Progress (0-95 %)
+                # Progress (0-100 %)
                 if i % max(1, total_frames // 100) == 0:
                     self.progress.emit("render",
-                                       int(i / total_frames * 95))
+                                       int(i / total_frames * 100))
 
             if use_vaapi:
                 ff_proc.stdin.close()
@@ -1527,6 +1499,13 @@ class PianoRollWindow(QtWidgets.QWidget):
         self._fullscreen = False
         self._taskbar = TaskbarProgress(self)
 
+        # System-tray icon for cross-platform export-done notifications
+        self._tray = QtWidgets.QSystemTrayIcon(self)
+        self._tray.setIcon(self.style().standardIcon(
+            QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self._tray.setToolTip("PianoLoTayu")
+        self._tray.show()
+
         # ── Top controls ────────────────────────────────────────────────
         self._sf_combo = QtWidgets.QComboBox(self)
         self._sf_combo.addItem("（无 SoundFont — 静音预览）", "")
@@ -1730,6 +1709,8 @@ class PianoRollWindow(QtWidgets.QWidget):
                         worker.wait(5000)
                 except RuntimeError:
                     pass  # C++ object already deleted by deleteLater
+        if self._tray is not None:
+            self._tray.hide()
         super().closeEvent(event)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
@@ -1923,7 +1904,7 @@ class PianoRollWindow(QtWidgets.QWidget):
         # ── Resolution ───────────────────────────────────────────────────
         res_row = QtWidgets.QHBoxLayout()
         res_combo = QtWidgets.QComboBox(dlg)
-        res_combo.addItems(["1920x1088 (1080p)", "1280x720 (720p)", "854x480 (480p)"])
+        res_combo.addItems(["1920x1080 (1080p)", "1280x720 (720p)", "854x480 (480p)"])
         res_combo.setCurrentIndex(0)
         res_row.addWidget(QtWidgets.QLabel("分辨率:"))
         res_row.addWidget(res_combo, 1)
@@ -2075,7 +2056,7 @@ class PianoRollWindow(QtWidgets.QWidget):
 
             _ci = codec_combo.currentIndex()
             _codec = _CODECS[_ci][1]
-            res_w, res_h = [(1920, 1088), (1280, 720), (854, 480)][res_combo.currentIndex()]
+            res_w, res_h = [(1920, 1080), (1280, 720), (854, 480)][res_combo.currentIndex()]
             fps = int(fps_combo.currentText())
             for w in _export_widgets:
                 w.setEnabled(False)
@@ -2094,10 +2075,6 @@ class PianoRollWindow(QtWidgets.QWidget):
                 mono_color=(_export_mono_hex
                             if mono_cb.isChecked() else ""),
             )
-            import sys
-            print(f"[DEBUG] do_export: mono_cb.checked={mono_cb.isChecked()} "
-                  f"_export_mono_hex={_export_mono_hex!r} "
-                  f"→ mono_color={(_export_mono_hex if mono_cb.isChecked() else '')!r}", flush=True)
             def _on_prog(phase: str, pct: int) -> None:
                 status_label.setText(_PHASE_NAMES.get(phase, phase))
                 status_label.setVisible(True)
@@ -2107,11 +2084,11 @@ class PianoRollWindow(QtWidgets.QWidget):
                 pbar.setValue(pct)
                 # Map phased progress to overall 0-100 % for taskbar
                 if phase == "render":
-                    overall = int(pct * 0.95)
+                    overall = int(pct * 0.45)
                 elif phase == "audio":
-                    overall = 95 + int(pct * 0.03)
+                    overall = 45 + int(pct * 0.45)
                 elif phase == "mux":
-                    overall = 98 + int(pct * 0.02)
+                    overall = 90 + int(pct * 0.1)
                 elif phase == "done":
                     overall = 100
                 else:
@@ -2159,6 +2136,10 @@ class PianoRollWindow(QtWidgets.QWidget):
             self._video_worker.wait(5000)
             self._video_worker = None
         dlg.accept()
+        QtWidgets.QApplication.alert(self, 0)
+        self._tray.showMessage(
+            "导出完成", f"视频已保存至：\n{output}",
+            QtWidgets.QSystemTrayIcon.MessageIcon.Information, 5000)
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("导出完成")
         box.setText(f"视频已保存至：\n{output}")
@@ -2343,6 +2324,11 @@ class PianoRollWindow(QtWidgets.QWidget):
             self._audio_worker = None
         self._taskbar.hide()
         dlg.accept()
+        if not self.isActiveWindow():
+            QtWidgets.QApplication.alert(self, 0)
+        self._tray.showMessage(
+            "导出完成", f"音频已保存至：\n{output}",
+            QtWidgets.QSystemTrayIcon.MessageIcon.Information, 5000)
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("导出完成")
         box.setText(f"音频已保存至：\n{output}")
