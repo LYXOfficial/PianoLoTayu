@@ -10,6 +10,7 @@ from PySide6 import QtWidgets, QtGui, QtCore
 from .piano_view import (
     MIN_PITCH, MAX_PITCH,
     KeyboardWidget, NoteGridView, MidiPlayer,
+    PlaybackOptions, default_track_enabled, list_track_infos,
 )
 from .win32_utils import TaskbarProgress, app_icon
 
@@ -31,23 +32,77 @@ def _std_icon(name: str, fallback: QtWidgets.QStyle.StandardPixmap) -> QtGui.QIc
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Clickable slider
+# Clickable + draggable seek slider
 # ═══════════════════════════════════════════════════════════════════════════
 
 class _SeekSlider(QtWidgets.QSlider):
-    clicked = QtCore.Signal(int)
+    """QSlider that jumps to the click position *and* keeps dragging.
+
+    Plain ``QSlider`` only drags when the press lands on the handle; a click on
+    the groove does a page-step.  A naïve ``setValue`` before ``super()`` also
+    fails: the linear ``x / width`` mapping does not match the style's groove /
+    handle geometry, so the handle never ends up under the cursor and drag mode
+    never engages.
+
+    We map pixels with the style, then drive press / move / release ourselves so
+    drag always works.  ``sliderPressed`` / ``sliderMoved`` / ``sliderReleased``
+    still fire via ``setSliderDown`` / ``setValue``.
+    """
+
+    def _value_at(self, pos: QtCore.QPoint) -> int:
+        """Pixel position → slider value, matching the current style geometry."""
+        opt = QtWidgets.QStyleOptionSlider()
+        self.initStyleOption(opt)
+        style = self.style()
+        assert style is not None
+        groove = style.subControlRect(
+            QtWidgets.QStyle.ComplexControl.CC_Slider,
+            opt,
+            QtWidgets.QStyle.SubControl.SC_SliderGroove,
+            self,
+        )
+        handle = style.subControlRect(
+            QtWidgets.QStyle.ComplexControl.CC_Slider,
+            opt,
+            QtWidgets.QStyle.SubControl.SC_SliderHandle,
+            self,
+        )
+        if self.orientation() == QtCore.Qt.Orientation.Horizontal:
+            # Centre the handle on the cursor (same as Qt's absolute-set path)
+            span = max(1, groove.width() - handle.width())
+            x = pos.x() - handle.width() // 2 - groove.x()
+            return QtWidgets.QStyle.sliderValueFromPosition(
+                self.minimum(), self.maximum(), x, span, opt.upsideDown)
+        span = max(1, groove.height() - handle.height())
+        y = pos.y() - handle.height() // 2 - groove.y()
+        return QtWidgets.QStyle.sliderValueFromPosition(
+            self.minimum(), self.maximum(), y, span, opt.upsideDown)
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        if self.orientation() == QtCore.Qt.Orientation.Horizontal:
-            val = (self.minimum() +
-                   (self.maximum() - self.minimum()) *
-                   event.position().x() / self.width())
-        else:
-            val = (self.minimum() +
-                   (self.maximum() - self.minimum()) *
-                   (1 - event.position().y() / self.height()))
-        self.clicked.emit(int(val))
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            # Enter drag mode first so setValue emits sliderMoved
+            self.setSliderDown(True)
+            self.setValue(self._value_at(event.position().toPoint()))
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if (self.isSliderDown()
+                and event.buttons() & QtCore.Qt.MouseButton.LeftButton):
+            self.setValue(self._value_at(event.position().toPoint()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if (event.button() == QtCore.Qt.MouseButton.LeftButton
+                and self.isSliderDown()):
+            self.setValue(self._value_at(event.position().toPoint()))
+            self.setSliderDown(False)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -111,6 +166,12 @@ class PianoRollWindow(QtWidgets.QWidget):
         self._btn_export_audio.setIcon(_std_icon(
             "audio-x-generic",
             QtWidgets.QStyle.StandardPixmap.SP_MediaVolume))
+        self._btn_play_opts = QtWidgets.QPushButton("播放选项")
+        self._btn_play_opts.setIcon(_std_icon(
+            "preferences-system",
+            QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self._btn_play_opts.setToolTip("预览 / 导出共用的音频播放选项")
+        self._playback_opts = PlaybackOptions()
 
         self._mono_cb = QtWidgets.QCheckBox("单色")
         self._mono_color_btn = QtWidgets.QPushButton()
@@ -150,6 +211,7 @@ class PianoRollWindow(QtWidgets.QWidget):
         top.addSpacing(12)
         top.addWidget(self._btn_export)
         top.addWidget(self._btn_export_audio)
+        top.addWidget(self._btn_play_opts)
         top.addWidget(self._export_progress)
         top.addStretch()
         top.addWidget(self._vertical_cb)
@@ -179,15 +241,18 @@ class PianoRollWindow(QtWidgets.QWidget):
 
         self._grid.vertical_offset_changed.connect(self._keyboard.set_offset_y)
         self._grid.horizontal_offset_changed.connect(self._on_grid_h_scroll)
+        self._grid.zoom_delta.connect(self._on_zoom_wheel)
 
         # ── Bottom seek bar ─────────────────────────────────────────────
         self._seek_bar = _SeekSlider(QtCore.Qt.Orientation.Horizontal, self)
         self._seek_bar.setRange(0, 1000)
+        # Press → drag flag; move → scrub view; release → seek audio.
+        # (_SeekSlider drives these via setSliderDown / setValue so groove
+        # clicks also drag, not just handle grabs.)
         self._seek_bar.sliderPressed.connect(
             lambda: setattr(self, '_seek_dragging', True))
         self._seek_bar.sliderReleased.connect(self._on_seek_release)
         self._seek_bar.sliderMoved.connect(self._on_seek_drag)
-        self._seek_bar.clicked.connect(self._on_seek_click)
         self._time_label = QtWidgets.QLabel("00:00 / 00:00")
 
         bottom = QtWidgets.QHBoxLayout()
@@ -209,6 +274,7 @@ class PianoRollWindow(QtWidgets.QWidget):
         self._btn_play.clicked.connect(self._on_play_pause)
         self._btn_export.clicked.connect(self._on_export)
         self._btn_export_audio.clicked.connect(self._on_export_audio)
+        self._btn_play_opts.clicked.connect(self._on_play_options)
         self._h_zoom.valueChanged.connect(self._on_h_zoom)
         self._mono_cb.toggled.connect(self._on_mono_toggle)
         self._vertical_cb.toggled.connect(self._on_vertical_toggle)
@@ -247,7 +313,25 @@ class PianoRollWindow(QtWidgets.QWidget):
             if obj is self._grid or obj is self._grid.viewport() or obj is self._keyboard:
                 self._on_fullscreen()
                 return True
+        if event.type() == QtCore.QEvent.Type.Wheel:
+            # Ctrl+wheel over keyboard also zooms (grid handles its own viewport)
+            if obj is self._keyboard:
+                we = event  # type: QtGui.QWheelEvent
+                if we.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier:
+                    dy = we.angleDelta().y() or we.pixelDelta().y()
+                    if dy != 0:
+                        self._on_zoom_wheel(1 if dy > 0 else -1)
+                    return True
         return False
+
+    def _on_zoom_wheel(self, step: int) -> None:
+        """Ctrl+wheel zoom — same range/axis as the top-right 缩放 slider."""
+        cur = self._h_zoom.value()
+        # ~10% per notch, minimum step 10; clamp to slider range
+        delta = max(10, int(round(cur * 0.1)))
+        new = cur + int(step) * delta
+        lo, hi = self._h_zoom.minimum(), self._h_zoom.maximum()
+        self._h_zoom.setValue(max(lo, min(hi, new)))
 
     def _on_sf_changed(self, _index: int) -> None:
         """Hot-swap / unload SoundFont (also works mid-playback)."""
@@ -287,9 +371,14 @@ class PianoRollWindow(QtWidgets.QWidget):
         else:
             if self._midi_path:
                 self._player.load_midi(self._midi_path)
+                # Ensure mute map exists for this MIDI
+                if self._playback_opts.track_enabled is None:
+                    self._playback_opts.track_enabled = default_track_enabled(
+                        self._player._midi)
             if self._player._midi is None:
                 QtWidgets.QMessageBox.warning(self, "提示", "没有加载 MIDI 文件")
                 return
+            self._player.set_playback_options(self._playback_opts)
             sf = self._sf_combo.currentData() or ""
             if sf:
                 if not self._player.set_soundfont(sf):
@@ -304,6 +393,208 @@ class PianoRollWindow(QtWidgets.QWidget):
             self._player.play(sf_path=sf, start_t=t)
             self._playing = True
             self._set_play_button(True)
+
+    def _on_play_options(self) -> None:
+        """Modal dialog: shared play/export audio options + per-track mute."""
+        # Need MIDI for track list — load if necessary (does not start audio)
+        if self._player._midi is None and self._midi_path:
+            self._player.load_midi(self._midi_path)
+        midi = self._player._midi
+        if midi is None:
+            QtWidgets.QMessageBox.warning(self, "提示", "没有加载 MIDI 文件")
+            return
+
+        if self._playback_opts.track_enabled is None:
+            self._playback_opts.track_enabled = default_track_enabled(midi)
+        else:
+            # Merge defaults for any new track indices
+            for i, en in default_track_enabled(midi).items():
+                self._playback_opts.track_enabled.setdefault(i, en)
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("音频选项")
+        dlg.setModal(True)
+        dlg.setWindowFlag(QtCore.Qt.WindowType.WindowMaximizeButtonHint, False)
+        dlg.setWindowFlag(QtCore.Qt.WindowType.WindowMinimizeButtonHint, False)
+        dlg.setSizeGripEnabled(False)
+
+        form = QtWidgets.QVBoxLayout(dlg)
+        form.setSpacing(10)
+
+        tip = QtWidgets.QLabel(
+            "轨道开关会同步到预览卷帘与导出视频的音符显隐，"
+            "以及预览 / 导出音频的播放；"
+            "若使用全钢琴音色，不建议开启鼓组的音频渲染",
+            dlg,
+        )
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color: #666;")
+        form.addWidget(tip)
+
+        # Count notes outside piano range (A0–C8) for the checkbox label
+        n_oor = 0
+        for inst in midi.instruments:
+            for note in inst.notes:
+                if note.pitch < MIN_PITCH or note.pitch > MAX_PITCH:
+                    n_oor += 1
+
+        cb_oor = QtWidgets.QCheckBox(
+            f"不忽略钢琴音域外音符（仅播放，不会渲染到视图）（{n_oor} 个）",
+            dlg,
+        )
+        cb_oor.setChecked(self._playback_opts.play_out_of_range)
+        form.addWidget(cb_oor)
+
+        cb_prog = QtWidgets.QCheckBox(
+            "使用对应音色匹配轨道，而非钢琴", dlg)
+        cb_prog.setChecked(self._playback_opts.use_track_programs)
+        form.addWidget(cb_prog)
+
+        form.addWidget(QtWidgets.QLabel("轨道：", dlg))
+
+        tracks = list_track_infos(midi)
+        n_tracks = len(tracks)
+
+        scroll = QtWidgets.QScrollArea(dlg)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+        # Reserve vertical-scrollbar gutter so "音符数" is never covered
+        sb_w = dlg.style().pixelMetric(
+            QtWidgets.QStyle.PixelMetric.PM_ScrollBarExtent)
+        if sb_w <= 0:
+            sb_w = 14
+
+        body = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(body)
+        # Extra right margin = scrollbar width (always reserved)
+        grid.setContentsMargins(4, 4, 4 + sb_w, 4)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(6)
+        grid.setRowStretch(0, 0)
+
+        # Header: select-all checkbox | 轨道名 | 音色 | 音符数
+        cb_all = QtWidgets.QCheckBox(body)
+        cb_all.setToolTip("全选 / 全不选")
+        grid.addWidget(cb_all, 0, 0)
+        for col, text in enumerate(("轨道名", "音色", "音符数"), start=1):
+            h = QtWidgets.QLabel(text, body)
+            f = h.font()
+            f.setBold(True)
+            h.setFont(f)
+            if col == 3:
+                h.setMinimumWidth(48)
+                h.setAlignment(
+                    QtCore.Qt.AlignmentFlag.AlignRight
+                    | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            grid.addWidget(h, 0, col)
+
+        track_cbs: dict[int, QtWidgets.QCheckBox] = {}
+        for row, info in enumerate(tracks, start=1):
+            idx = info["index"]
+            cb = QtWidgets.QCheckBox(body)
+            cb.setChecked(self._playback_opts.is_track_enabled(
+                idx, info["is_drum"]))
+            if info["is_drum"]:
+                cb.setToolTip("鼓组 — 默认关闭（开启后卷帘/导出视频也会显示）")
+            track_cbs[idx] = cb
+            grid.addWidget(cb, row, 0)
+            grid.addWidget(QtWidgets.QLabel(info["name"], body), row, 1)
+            grid.addWidget(QtWidgets.QLabel(info["program"], body), row, 2)
+            nlab = QtWidgets.QLabel(str(info["n_notes"]), body)
+            nlab.setMinimumWidth(48)
+            nlab.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignRight
+                | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            grid.addWidget(nlab, row, 3)
+            grid.setRowStretch(row, 0)
+
+        grid.setRowStretch(n_tracks + 1, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
+        grid.setColumnMinimumWidth(3, 48)
+        scroll.setWidget(body)
+
+        def _sync_all_cb() -> None:
+            if not track_cbs:
+                cb_all.blockSignals(True)
+                cb_all.setCheckState(QtCore.Qt.CheckState.Unchecked)
+                cb_all.blockSignals(False)
+                return
+            n_on = sum(1 for c in track_cbs.values() if c.isChecked())
+            cb_all.blockSignals(True)
+            if n_on == 0:
+                cb_all.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            elif n_on == len(track_cbs):
+                cb_all.setCheckState(QtCore.Qt.CheckState.Checked)
+            else:
+                cb_all.setCheckState(QtCore.Qt.CheckState.PartiallyChecked)
+            cb_all.blockSignals(False)
+
+        def _on_all_clicked() -> None:
+            # Toggle: if all on → all off; otherwise select all
+            all_on = (
+                bool(track_cbs)
+                and all(c.isChecked() for c in track_cbs.values())
+            )
+            target = not all_on
+            for c in track_cbs.values():
+                c.blockSignals(True)
+                c.setChecked(target)
+                c.blockSignals(False)
+            _sync_all_cb()
+
+        cb_all.setTristate(True)
+        cb_all.clicked.connect(_on_all_clicked)
+        for c in track_cbs.values():
+            c.toggled.connect(lambda _=False: _sync_all_cb())
+        _sync_all_cb()
+
+        # Height ≈ header + rows; cap so many tracks scroll instead of growing
+        row_h = 28
+        content_h = 8 + row_h * (1 + max(n_tracks, 1)) + 8
+        scroll.setFixedHeight(min(max(content_h, 56), 280))
+        form.addWidget(scroll, 0)
+
+        # 确定 left / 取消 right (Windows-style primary then dismiss)
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch()
+        btn_ok = QtWidgets.QPushButton("确定", dlg)
+        btn_cancel = QtWidgets.QPushButton("取消", dlg)
+        btn_cancel.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel)
+        form.addLayout(btn_row)
+
+        dlg.layout().setSizeConstraint(
+            QtWidgets.QLayout.SizeConstraint.SetFixedSize)
+
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+
+        self._playback_opts = PlaybackOptions(
+            play_out_of_range=cb_oor.isChecked(),
+            use_track_programs=cb_prog.isChecked(),
+            track_enabled={i: cb.isChecked() for i, cb in track_cbs.items()},
+        )
+        # Sync roll visibility (including drums when enabled)
+        self._grid.set_track_enabled(self._playback_opts.track_enabled)
+        # Apply immediately (affects next play tick / re-maps programs)
+        was_playing = self._playing
+        if was_playing:
+            # Keep transport running but re-apply programs / mute map
+            t = 0.0
+            dur = self._grid.scene_duration_s()
+            if dur > 0:
+                t = self._seek_bar.value() / 1000.0 * dur
+            self._player.set_playback_options(self._playback_opts)
+            self._player.seek(t)
+        else:
+            self._player.set_playback_options(self._playback_opts)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._player.cleanup()
@@ -476,28 +767,25 @@ class PianoRollWindow(QtWidgets.QWidget):
         return f"{m:02d}:{s:02d}"
 
     def _on_position(self, t: float) -> None:
+        # While the user is scrubbing the seek bar, leave the slider/label alone
+        # so playback ticks don't fight the drag.
+        if self._seek_dragging:
+            return
         dur = self._grid.scene_duration_s()
         self._time_label.setText(f"{self._fmt_time(t)} / {self._fmt_time(dur)}")
-        if not self._seek_dragging and dur > 0:
+        if dur > 0:
             self._seek_bar.setValue(int(t / dur * 1000))
         # Auto-scroll: playhead at bottom (vertical) / left edge (horizontal)
-        if self._playing and not self._seek_dragging:
+        if self._playing:
             self._grid.scroll_to_time(t)
 
     def _on_seek_drag(self, val: int) -> None:
+        """Scrub the roll view while the seek handle is held (audio commits on release)."""
         dur = self._grid.scene_duration_s()
         if dur > 0:
             t = val / 1000.0 * dur
             self._grid.scroll_to_time(t)
             self._time_label.setText(f"{self._fmt_time(t)} / {self._fmt_time(dur)}")
-
-    def _on_seek_click(self, val: int) -> None:
-        dur = self._grid.scene_duration_s()
-        if dur > 0:
-            t = val / 1000.0 * dur
-            self._seek_bar.setValue(val)
-            self._grid.scroll_to_time(t)
-            self._player.seek(t)
 
     def _on_seek_release(self) -> None:
         self._seek_dragging = False
@@ -762,8 +1050,8 @@ class PianoRollWindow(QtWidgets.QWidget):
         btn_do = QtWidgets.QPushButton("导出", dlg)
         btn_cancel = QtWidgets.QPushButton("取消", dlg)
         btn_cancel.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-        btn_row.addWidget(btn_cancel)
         btn_row.addWidget(btn_do)
+        btn_row.addWidget(btn_cancel)
 
         # Progress
         status_label = QtWidgets.QLabel("", dlg)
@@ -831,6 +1119,7 @@ class PianoRollWindow(QtWidgets.QWidget):
                 vertical=vertical_cb.isChecked(),
                 mono_color=(_export_mono_hex
                             if mono_cb.isChecked() else ""),
+                playback=self._playback_opts,
             )
             def _on_prog(phase: str, pct: int) -> None:
                 status_label.setText(_PHASE_NAMES.get(phase, phase))
@@ -1062,8 +1351,8 @@ class PianoRollWindow(QtWidgets.QWidget):
         btn_export_dlg = QtWidgets.QPushButton("导出", dlg)
         btn_cancel = QtWidgets.QPushButton("取消", dlg)
         btn_cancel.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-        btn_row.addWidget(btn_cancel)
         btn_row.addWidget(btn_export_dlg)
+        btn_row.addWidget(btn_cancel)
 
         # ── Progress ─────────────────────────────────────────────────────
         status_label = QtWidgets.QLabel("", dlg)
@@ -1166,6 +1455,7 @@ class PianoRollWindow(QtWidgets.QWidget):
                 self._midi_path, sf, out,
                 bitrate=br_combo.currentText().strip() + "k",
                 a_codec=a_codec_id,
+                playback=self._playback_opts,
             )
             def _on_audio_prog(msg: str, pct: int) -> None:
                 status_label.setText(msg)

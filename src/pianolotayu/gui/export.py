@@ -9,6 +9,7 @@ from PySide6 import QtWidgets, QtGui, QtCore
 from .piano_view import (
     MIN_PITCH, MAX_PITCH, _KEY_WHITE,
     _note_color, _dist_y, _dist_h, load_pretty_midi, _midi_note_name,
+    PlaybackOptions,
 )
 from .win32_utils import setup_fluidsynth_dll, fluidsynth_status_message
 
@@ -338,6 +339,7 @@ class VideoExportWorker(QtCore.QThread):
                  a_codec: str = "aac", a_bitrate: str = "192k",
                  muted: bool = False,
                  vertical: bool = False, mono_color: str = "",
+                 playback: PlaybackOptions | None = None,
                  parent=None):
         super().__init__(parent)
         self._midi = midi_path
@@ -352,6 +354,7 @@ class VideoExportWorker(QtCore.QThread):
         self._a_br = a_bitrate
         self._muted = muted
         self._vertical = vertical
+        self._playback = playback or PlaybackOptions()
         if mono_color:
             c = QtGui.QColor(mono_color)
             self._mono_rgb: tuple[int, int, int] | None = (
@@ -391,11 +394,13 @@ class VideoExportWorker(QtCore.QThread):
                 extra = self._h - total_pitches * note_h
                 grid_w = self._w - key_w
 
-            # ── Collect all notes (keep multi-track unisons) ───────────────
+            # ── Collect notes for VIDEO (same track mute map as preview) ──
+            # Audio uses playback options separately in _render_audio_sync.
             # (pitch, start, end, vel, inst_idx)
+            opt = self._playback
             all_notes: list[tuple[int, float, float, int, int]] = []
             for inst_i, inst in enumerate(pm.instruments):
-                if inst.is_drum:
+                if not opt.is_track_enabled(inst_i, bool(inst.is_drum)):
                     continue
                 for note in inst.notes:
                     if MIN_PITCH <= note.pitch <= MAX_PITCH:
@@ -852,6 +857,7 @@ class VideoExportWorker(QtCore.QThread):
                     self._midi, self._sf, self._a_br,
                     progress_cb=lambda pct: self.progress.emit("audio", pct),
                     should_abort=self.isInterruptionRequested,
+                    playback=self._playback,
                 )
                 if self.isInterruptionRequested():
                     return
@@ -948,13 +954,15 @@ class VideoExportWorker(QtCore.QThread):
 
 
 def _render_audio_sync(midi_path: str, sf_path: str, bitrate: str,
-                       progress_cb=None, should_abort=None) -> str:
+                       progress_cb=None, should_abort=None,
+                       playback: PlaybackOptions | None = None) -> str:
     """Render MIDI→WAV synchronously, return path to WAV file.
 
     If *progress_cb* is given it is called as ``progress_cb(pct)``
     with ``pct`` in 0–100.
     If *should_abort* is a zero-arg callable returning True, rendering stops
     early and returns ``""``.
+    *playback* controls track mute, out-of-range notes, and timbre matching.
     """
     import wave
     import os
@@ -966,6 +974,7 @@ def _render_audio_sync(midi_path: str, sf_path: str, bitrate: str,
         raise RuntimeError(fluidsynth_status_message() + f"\n\n详细：{exc}") from exc
     import tempfile
 
+    opt = playback or PlaybackOptions()
     pm = load_pretty_midi(midi_path)
     duration = pm.get_end_time()
     RATE = 44100
@@ -976,36 +985,45 @@ def _render_audio_sync(midi_path: str, sf_path: str, bitrate: str,
         if sfid < 0:
             raise RuntimeError(f"SoundFont 加载失败 (code {sfid}): {sf_path}")
 
-        # Map instruments → channels (skip ch 9 drums); all piano timbre.
-        # Separate channels keep multi-track unisons / re-triggers audible.
+        # Map enabled instruments → channels
         inst_ch: dict[int, int] = {}
         ch = 0
         for i, inst in enumerate(pm.instruments):
+            if not opt.is_track_enabled(i, bool(inst.is_drum)):
+                continue
             if inst.is_drum:
+                inst_ch[i] = 9
+                try:
+                    fs.program_select(9, sfid, 128, 0)
+                except Exception:
+                    fs.program_select(9, sfid, 0, 0)
                 continue
             if ch == 9:
                 ch = 10
             if ch > 15:
                 ch = 0
             inst_ch[i] = ch
-            fs.program_select(ch, sfid, 0, 0)  # always acoustic piano
+            prog = (int(getattr(inst, "program", 0) or 0)
+                    if opt.use_track_programs else 0)
+            try:
+                fs.program_select(ch, sfid, 0, prog)
+            except Exception:
+                fs.program_select(ch, sfid, 0, 0)
             ch += 1
         if not inst_ch:
             fs.program_select(0, sfid, 0, 0)
 
         # Events: (time, kind, channel, pitch, velocity)
-        # Include inst_idx in identity so same-pitch multi-track notes all fire.
         events: list[tuple[float, str, int, int, int]] = []
         for i, inst in enumerate(pm.instruments):
-            if inst.is_drum:
+            if i not in inst_ch:
                 continue
-            c = inst_ch.get(i, 0)
+            c = inst_ch[i]
             for note in inst.notes:
-                if note.pitch < MIN_PITCH or note.pitch > MAX_PITCH:
+                if not opt.pitch_ok(note.pitch):
                     continue
                 events.append((note.start, "on", c, note.pitch, note.velocity or 100))
                 events.append((note.end, "off", c, note.pitch, 0))
-        # On before off at the same timestamp (re-articulation / double taps)
         events.sort(key=lambda e: (e[0], 0 if e[1] == "on" else 1))
 
         total_samples = int(RATE * (duration + 1.5))
@@ -1017,7 +1035,6 @@ def _render_audio_sync(midi_path: str, sf_path: str, bitrate: str,
         total_steps = (duration + 1.0) / dt
         step = 0
         samp_pos = 0
-        # Track how many active voices per (channel, pitch) so noteoff is safe
         voice_count: dict[tuple[int, int], int] = {}
         while t < duration + 1.0:
             if should_abort is not None and should_abort():
@@ -1026,7 +1043,6 @@ def _render_audio_sync(midi_path: str, sf_path: str, bitrate: str,
                 _time, kind, c, pitch, vel = events[ev_idx]
                 key = (c, pitch)
                 if kind == "on":
-                    # Re-trigger attack even if previous note still held
                     if voice_count.get(key, 0) > 0:
                         try:
                             fs.noteoff(c, pitch)
@@ -1247,13 +1263,15 @@ class AudioExportWorker(QtCore.QThread):
     error = QtCore.Signal(str)
 
     def __init__(self, midi_path: str, sf_path: str, output_path: str,
-                 bitrate: str = "192k", a_codec: str = "", parent=None):
+                 bitrate: str = "192k", a_codec: str = "",
+                 playback: PlaybackOptions | None = None, parent=None):
         super().__init__(parent)
         self._midi = midi_path
         self._sf = sf_path
         self._output = output_path
         self._bitrate = bitrate
         self._a_codec = a_codec or ""
+        self._playback = playback or PlaybackOptions()
 
     def run(self) -> None:
         import os
@@ -1275,6 +1293,7 @@ class AudioExportWorker(QtCore.QThread):
             tmp_wav = _render_audio_sync(
                 self._midi, self._sf, self._bitrate, progress_cb=_prog,
                 should_abort=self.isInterruptionRequested,
+                playback=self._playback,
             )
             if self.isInterruptionRequested() or not tmp_wav:
                 return

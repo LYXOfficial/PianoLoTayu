@@ -331,15 +331,19 @@ class BeepSuppressor(QtCore.QAbstractNativeEventFilter):
 # When the app runs as Administrator and Explorer does not, OLE drag-drop is
 # blocked by UIPI → permanent "prohibited" cursor.  Classic WM_DROPFILES can
 # still work if we:
-#   1. ChangeWindowMessageFilterEx to allow the drop messages in
+#   1. ChangeWindowMessageFilter (+ Ex) to allow DROPFILES/COPYDATA/COPYGLOBALDATA
 #   2. DragAcceptFiles(hwnd, TRUE)
-#   3. Handle WM_DROPFILES and extract paths via DragQueryFileW
+#   3. When elevated: RevokeDragDrop(hwnd) so Explorer falls back from OLE
+#      (OLE is preferred; if it fails UIPI, drop is aborted — no WM_DROPFILES)
+#   4. Handle WM_DROPFILES and extract paths via DragQueryFileW
 
 if _IS_WIN32:
     WM_DROPFILES = 0x0233
     WM_COPYDATA = 0x004A
-    WM_COPYGLOBALDATA = 0x0049  # undocumented but required for HDROP
+    WM_COPYGLOBALDATA = 0x0049  # undocumented but required for HDROP across UIPI
+    MSGFLT_ADD = 1
     MSGFLT_ALLOW = 1
+    _DROP_MSGS = (WM_DROPFILES, WM_COPYDATA, WM_COPYGLOBALDATA)
 
     class _CHANGEFILTERSTRUCT(ctypes.Structure):
         _fields_ = [
@@ -347,34 +351,114 @@ if _IS_WIN32:
             ("ExtStatus", wintypes.DWORD),
         ]
 
-    def _allow_message(hwnd: int, msg: int) -> None:
-        user32 = ctypes.windll.user32
-        cfs = _CHANGEFILTERSTRUCT()
-        cfs.cbSize = sizeof(_CHANGEFILTERSTRUCT)
-        # BOOL ChangeWindowMessageFilterEx(HWND, UINT, DWORD, CHANGEFILTERSTRUCT*)
+    def is_process_elevated() -> bool:
+        """True when this process is running elevated (Administrator)."""
         try:
-            user32.ChangeWindowMessageFilterEx(
-                wintypes.HWND(hwnd), wintypes.UINT(msg),
-                wintypes.DWORD(MSGFLT_ALLOW), byref(cfs),
-            )
-        except Exception:
-            # Vista fallback: ChangeWindowMessageFilter(msg, MSGFLT_ADD=1)
+            # TokenElevation: TOKEN_ELEVATION { DWORD TokenIsElevated }
+            TOKEN_QUERY = 0x0008
+            TokenElevation = 20
+            kernel32 = ctypes.windll.kernel32
+            advapi32 = ctypes.windll.advapi32
+            h_proc = kernel32.GetCurrentProcess()
+            h_token = wintypes.HANDLE()
+            if not advapi32.OpenProcessToken(
+                h_proc, TOKEN_QUERY, byref(h_token),
+            ):
+                # Fallback: older helper (also true for elevated admins)
+                return bool(ctypes.windll.shell32.IsUserAnAdmin())
             try:
-                user32.ChangeWindowMessageFilter(wintypes.UINT(msg), 1)
+                elev = wintypes.DWORD()
+                size = wintypes.DWORD()
+                ok = advapi32.GetTokenInformation(
+                    h_token, TokenElevation,
+                    byref(elev), sizeof(elev), byref(size),
+                )
+                if ok:
+                    return bool(elev.value)
+            finally:
+                kernel32.CloseHandle(h_token)
+        except Exception:
+            pass
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+
+    def _allow_drop_messages_process_wide() -> None:
+        """Process-wide UIPI filter — required so non-elevated Explorer can send
+        HDROP into an elevated process (WM_COPYGLOBALDATA especially)."""
+        user32 = ctypes.windll.user32
+        # BOOL ChangeWindowMessageFilter(UINT message, DWORD dwFlag)
+        # MSGFLT_ADD = 1.  Present since Vista; no-op failure is fine.
+        try:
+            user32.ChangeWindowMessageFilter.argtypes = [
+                wintypes.UINT, wintypes.DWORD,
+            ]
+            user32.ChangeWindowMessageFilter.restype = wintypes.BOOL
+        except Exception:
+            pass
+        for msg in _DROP_MSGS:
+            try:
+                user32.ChangeWindowMessageFilter(
+                    wintypes.UINT(msg), wintypes.DWORD(MSGFLT_ADD),
+                )
             except Exception:
                 pass
 
-    def _drag_query_files(hdrop: int) -> list[str]:
+    def _allow_drop_messages_for_hwnd(hwnd: int) -> None:
+        """Per-window filter (Win7+). Complements the process-wide filter."""
+        user32 = ctypes.windll.user32
+        cfs = _CHANGEFILTERSTRUCT()
+        cfs.cbSize = sizeof(_CHANGEFILTERSTRUCT)
+        try:
+            user32.ChangeWindowMessageFilterEx.argtypes = [
+                wintypes.HWND, wintypes.UINT, wintypes.DWORD,
+                ctypes.c_void_p,
+            ]
+            user32.ChangeWindowMessageFilterEx.restype = wintypes.BOOL
+        except Exception:
+            pass
+        for msg in _DROP_MSGS:
+            try:
+                user32.ChangeWindowMessageFilterEx(
+                    wintypes.HWND(hwnd), wintypes.UINT(msg),
+                    wintypes.DWORD(MSGFLT_ALLOW), byref(cfs),
+                )
+            except Exception:
+                pass
+
+    def _drag_query_drop(
+        hdrop: int,
+    ) -> tuple[list[str], tuple[int, int] | None]:
+        """Return (paths, client_point).  Point is in the receiving HWND's
+        client coords (from DragQueryPoint), or None if unavailable.
+
+        Must run before DragFinish — point + files are read first.
+        """
         shell32 = ctypes.windll.shell32
+        pt: tuple[int, int] | None = None
+        try:
+            shell32.DragQueryPoint.argtypes = [
+                wintypes.HANDLE, POINTER(wintypes.POINT),
+            ]
+            shell32.DragQueryPoint.restype = wintypes.BOOL
+            p = wintypes.POINT()
+            if shell32.DragQueryPoint(wintypes.HANDLE(hdrop), byref(p)):
+                pt = (int(p.x), int(p.y))
+        except Exception:
+            pt = None
+
         shell32.DragQueryFileW.argtypes = [
             wintypes.HANDLE, wintypes.UINT,
             wintypes.LPWSTR, wintypes.UINT,
         ]
         shell32.DragQueryFileW.restype = wintypes.UINT
-        count = shell32.DragQueryFileW(wintypes.HANDLE(hdrop), 0xFFFFFFFF, None, 0)
+        count = shell32.DragQueryFileW(
+            wintypes.HANDLE(hdrop), 0xFFFFFFFF, None, 0,
+        )
         paths: list[str] = []
         buf = ctypes.create_unicode_buffer(32768)
-        for i in range(count):
+        for i in range(int(count)):
             n = shell32.DragQueryFileW(
                 wintypes.HANDLE(hdrop), wintypes.UINT(i), buf, 32768,
             )
@@ -384,7 +468,28 @@ if _IS_WIN32:
             shell32.DragFinish(wintypes.HANDLE(hdrop))
         except Exception:
             pass
-        return paths
+        return paths, pt
+
+    def _revoke_ole_drop(hwnd: int) -> None:
+        """Remove Qt/OLE IDropTarget so Explorer falls back to WM_DROPFILES.
+
+        Without this, elevated targets keep a registered OLE drop target;
+        non-elevated Explorer tries OLE first, UIPI blocks it, and the drop
+        is aborted — WM_DROPFILES is never sent.
+        """
+        try:
+            # HRESULT RevokeDragDrop(HWND)
+            ole32 = ctypes.windll.ole32
+            ole32.RevokeDragDrop.argtypes = [wintypes.HWND]
+            ole32.RevokeDragDrop.restype = ctypes.c_long
+            ole32.RevokeDragDrop(wintypes.HWND(hwnd))
+        except Exception:
+            pass
+
+
+else:
+    def is_process_elevated() -> bool:
+        return False
 
 
 class ElevatedDropFilter(QtCore.QAbstractNativeEventFilter):
@@ -398,50 +503,123 @@ class ElevatedDropFilter(QtCore.QAbstractNativeEventFilter):
 
     def __init__(self, callback) -> None:
         super().__init__()
-        self._callback = callback  # callable(list[str])
+        # callback(paths: list[str], client_pt: tuple[int,int] | None)
+        # client_pt = drop position in the top-level HWND client coords
+        self._callback = callback
 
     def nativeEventFilter(
         self, eventType: QtCore.QByteArray, message: object,
     ) -> tuple[bool, int]:
         if not _IS_WIN32:
             return False, 0
-        et = bytes(eventType) if not isinstance(eventType, (bytes, bytearray)) else eventType
+        et = (bytes(eventType)
+              if not isinstance(eventType, (bytes, bytearray))
+              else eventType)
         if et != b"windows_generic_MSG":
             return False, 0
         msg = _native_msg(message)
         if msg is None or msg.message != WM_DROPFILES:
             return False, 0
-        paths = _drag_query_files(int(msg.wParam))
+        # wParam is HDROP
+        try:
+            hdrop = int(msg.wParam)
+        except (TypeError, ValueError):
+            return True, 0
+        paths, pt = _drag_query_drop(hdrop)
         if paths and self._callback is not None:
             # Defer to Qt event loop so we stay out of the native filter stack
-            QtCore.QTimer.singleShot(0, lambda p=list(paths): self._callback(p))
+            QtCore.QTimer.singleShot(
+                0,
+                lambda p=list(paths), cpt=pt: self._callback(p, cpt),
+            )
         return True, 0
 
 
 def enable_elevated_file_drop(
     widget: QtWidgets.QWidget, callback,
 ) -> ElevatedDropFilter | None:
-    """Allow non-elevated Explorer to drop files onto an elevated *widget*.
+    """Allow non-elevated Explorer to drop files onto *widget* when elevated.
+
+    Always installs the UIPI message filter + ``DragAcceptFiles``.  When the
+    process is elevated, also revokes the OLE drop target (which UIPI would
+    otherwise leave in a permanent "prohibited" state) so Explorer falls back
+    to classic ``WM_DROPFILES``.
 
     Returns the installed filter (keep a reference), or None on non-Windows /
-    if the HWND is not ready yet.
+    if the HWND is not ready yet.  Call ``reassert_elevated_file_drop`` later
+    if Qt may have re-registered OLE.
     """
     if not _IS_WIN32:
         return None
-    hwnd = _get_hwnd(widget)
-    if not hwnd:
+    if not reassert_elevated_file_drop(widget):
         return None
-    for m in (WM_DROPFILES, WM_COPYDATA, WM_COPYGLOBALDATA):
-        _allow_message(hwnd, m)
-    try:
-        ctypes.windll.shell32.DragAcceptFiles(wintypes.HWND(hwnd), True)
-    except Exception:
+    if callback is None:
         return None
     filt = ElevatedDropFilter(callback)
     app = QtWidgets.QApplication.instance()
     if app is not None:
         app.installNativeEventFilter(filt)
     return filt
+
+
+def reassert_elevated_file_drop(widget: QtWidgets.QWidget) -> bool:
+    """Re-apply UIPI filter + DragAcceptFiles (+ OLE revoke when elevated).
+
+    Safe to call repeatedly — does not install another native event filter.
+    Returns True if the HWND was ready and setup was applied.
+    """
+    if not _IS_WIN32:
+        return False
+    hwnd = _get_hwnd(widget)
+    if not hwnd:
+        return False
+
+    # 1) UIPI: let non-elevated senders deliver drop messages
+    _allow_drop_messages_process_wide()
+    _allow_drop_messages_for_hwnd(hwnd)
+
+    # 2) Classic drop target flag on the top-level HWND
+    try:
+        shell32 = ctypes.windll.shell32
+        shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+        shell32.DragAcceptFiles.restype = None
+        shell32.DragAcceptFiles(wintypes.HWND(hwnd), True)
+    except Exception:
+        return False
+
+    # 3) Elevated: kill OLE so Explorer doesn't abort after UIPI-blocked OLE
+    if is_process_elevated():
+        _revoke_ole_drop(hwnd)
+        # Also clear Qt acceptDrops on the window tree — otherwise Qt may
+        # re-RegisterDragDrop on later events and steal the target again.
+        try:
+            widget.setAcceptDrops(False)
+        except Exception:
+            pass
+        for child in widget.findChildren(QtWidgets.QWidget):
+            try:
+                if child.acceptDrops():
+                    child.setAcceptDrops(False)
+            except Exception:
+                pass
+        # Re-assert DragAcceptFiles after RevokeDragDrop
+        try:
+            ctypes.windll.shell32.DragAcceptFiles(
+                wintypes.HWND(hwnd), True,
+            )
+        except Exception:
+            pass
+    return True
+
+
+def prepare_elevated_drop_filters() -> None:
+    """Process-wide UIPI filter — call once at startup (before first show)."""
+    if not _IS_WIN32:
+        return
+    try:
+        _allow_drop_messages_process_wide()
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

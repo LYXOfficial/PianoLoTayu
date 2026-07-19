@@ -23,7 +23,13 @@ class DropLabel(QtWidgets.QLabel):
         DRAG = 2
         PRESS = 3
 
-    _ALPHAS = {State.IDLE: 0.0, State.HOVER: 0.05, State.DRAG: 0.14, State.PRESS: 0.14}
+    # Background fill alpha per state (depth)
+    _ALPHAS = {
+        State.IDLE: 0.0,
+        State.HOVER: 0.06,
+        State.DRAG: 0.18,
+        State.PRESS: 0.16,
+    }
     SUPPORTED_SUFFIXES = {
         ".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac", ".mid", ".midi",
     }
@@ -44,6 +50,10 @@ class DropLabel(QtWidgets.QLabel):
         self._anim: QtCore.QPropertyAnimation | None = None
         self._border_color = border_color
         self._border_radius = border_radius
+        # External drag highlight (e.g. elevated WM_DROPFILES path has no OLE events)
+        self._external_drag = False
+        # True while a local mouse press is in progress (not a shell file drag)
+        self._local_press = False
 
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_Hover)
         self.setAcceptDrops(True)
@@ -61,28 +71,57 @@ class DropLabel(QtWidgets.QLabel):
         super().setObjectName(name)
         self._refresh_base_style()
 
+    def _border_spec(self) -> str:
+        """Dashed idle / solid deeper border when pressed or dragging files."""
+        r = self._border_radius
+        if self._state in (self.State.DRAG, self.State.PRESS):
+            # Solid + slightly darker = “pressed in” depth
+            return (
+                f"border: 2px solid #888;"
+                f"border-radius: {r}px;"
+            )
+        if self._state == self.State.HOVER:
+            return (
+                f"border: 2px dashed #999;"
+                f"border-radius: {r}px;"
+            )
+        return (
+            f"border: 2px dashed {self._border_color};"
+            f"border-radius: {r}px;"
+        )
+
     def _refresh_base_style(self) -> None:
         sel = f"QLabel#{self.objectName() or 'DropLabel'}"
         self._base_style = (
             f"{sel} {{"
             f"background: transparent;"
-            f"border: 2px dashed {self._border_color};"
-            f"border-radius: {self._border_radius}px;"
+            f"{self._border_spec()}"
             f"}}"
         )
         self._apply_bg(self._bg_alpha)
 
     def _apply_bg(self, value: float) -> None:
-        """Merge base border style with the animated background alpha."""
+        """Merge border style with the animated background alpha."""
+        sel = f"QLabel#{self.objectName() or 'DropLabel'}"
         a = int(value * 255)
         if a < 2:
-            self.setStyleSheet(self._base_style)
-        else:
-            sel = f"QLabel#{self.objectName() or 'DropLabel'}"
             self.setStyleSheet(
-                self._base_style + (
-                    f"{sel} {{ background: rgba(0,0,0,{a}); }}"
-                )
+                f"{sel} {{"
+                f"background: transparent;"
+                f"{self._border_spec()}"
+                f"}}"
+            )
+        else:
+            # Slight warm lift on drag for more “depth”
+            if self._state == self.State.DRAG:
+                bg = f"rgba(40,40,45,{a})"
+            else:
+                bg = f"rgba(0,0,0,{a})"
+            self.setStyleSheet(
+                f"{sel} {{"
+                f"background: {bg};"
+                f"{self._border_spec()}"
+                f"}}"
             )
 
     # ── Qt property (animated) ──────────────────────────────────────────
@@ -111,7 +150,51 @@ class DropLabel(QtWidgets.QLabel):
         if new == self._state:
             return
         self._state = new
+        # Border changes immediately with state; fill animates
+        self._refresh_base_style()
         self._animate_to(self._ALPHAS.get(new, 0.0))
+
+    def set_external_drag(self, active: bool) -> None:
+        """Drive the drag-depth highlight from outside Qt's OLE drag events.
+
+        Used when the process is elevated: OLE is revoked for UIPI, so
+        ``dragEnterEvent`` never runs — the main window polls cursor/button
+        and calls this instead.
+        """
+        # Don't steal a local click (open file dialog) for the drag look
+        if self._local_press:
+            active = False
+        active = bool(active)
+        if active == self._external_drag and (
+            (active and self._state == self.State.DRAG)
+            or (not active and self._state != self.State.DRAG)
+        ):
+            return
+        self._external_drag = active
+        if active:
+            self._set_state(self.State.DRAG)
+        else:
+            if self._local_press:
+                return  # leave PRESS alone
+            # Back to hover if cursor still inside, else idle
+            if self.rect().contains(self.mapFromGlobal(QtGui.QCursor.pos())):
+                self._set_state(self.State.HOVER)
+            else:
+                self._set_state(self.State.IDLE)
+
+    def pulse_drop_feedback(self) -> None:
+        """Brief depth flash after a successful drop (any path)."""
+        self._external_drag = False
+        self._set_state(self.State.DRAG)
+        QtCore.QTimer.singleShot(160, self._after_drop_pulse)
+
+    def _after_drop_pulse(self) -> None:
+        if self._external_drag:
+            return  # still dragging another file
+        if self.rect().contains(self.mapFromGlobal(QtGui.QCursor.pos())):
+            self._set_state(self.State.HOVER)
+        else:
+            self._set_state(self.State.IDLE)
 
     # ── Events ─────────────────────────────────────────────────────────
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
@@ -120,6 +203,7 @@ class DropLabel(QtWidgets.QLabel):
         if _mime_looks_like_files(event.mimeData()):
             event.setDropAction(QtCore.Qt.DropAction.CopyAction)
             event.accept()
+            self._external_drag = False
             self._set_state(self.State.DRAG)
         else:
             event.ignore()
@@ -128,33 +212,51 @@ class DropLabel(QtWidgets.QLabel):
         if _mime_looks_like_files(event.mimeData()):
             event.setDropAction(QtCore.Qt.DropAction.CopyAction)
             event.accept()
+            # Keep depth while moving inside (re-enter after leave edge cases)
+            if self._state != self.State.DRAG:
+                self._set_state(self.State.DRAG)
         else:
             event.ignore()
 
     def dragLeaveEvent(self, _event: QtGui.QDragLeaveEvent) -> None:
+        self._external_drag = False
         self._set_state(self.State.IDLE)
         if self.rect().contains(self.mapFromGlobal(QtGui.QCursor.pos())):
             self._set_state(self.State.HOVER)
 
     def dropEvent(self, event: QtGui.QDropEvent) -> None:
-        self._set_state(self.State.IDLE)
         paths = paths_from_mime(event.mimeData())
         paths = [p for p in paths if _has_supported_suffix(p)]
         if paths:
             event.setDropAction(QtCore.Qt.DropAction.CopyAction)
             event.accept()
+            self.pulse_drop_feedback()
             self.files_dropped.emit(paths)
         else:
+            self._external_drag = False
+            self._set_state(self.State.IDLE)
             event.ignore()
 
     def enterEvent(self, _event: QtCore.QEvent) -> None:
+        if self._external_drag:
+            self._set_state(self.State.DRAG)
+            return
         if self._state not in (self.State.DRAG, self.State.PRESS):
             self._set_state(self.State.HOVER)
 
     def leaveEvent(self, _event: QtCore.QEvent) -> None:
+        if self._external_drag:
+            # Shell drag may still be over us; external poll owns DRAG
+            return
+        if self._state == self.State.DRAG:
+            # OLE dragLeave already handled; don't clobber mid-drag
+            return
         self._set_state(self.State.IDLE)
 
     def mousePressEvent(self, _event: QtGui.QMouseEvent) -> None:
+        if self._external_drag:
+            return
+        self._local_press = True
         self._set_state(self.State.PRESS)
 
     def mouseMoveEvent(self, _event: QtGui.QMouseEvent) -> None:
@@ -166,7 +268,9 @@ class DropLabel(QtWidgets.QLabel):
                 self._set_state(self.State.PRESS)
 
     def mouseReleaseEvent(self, _event: QtGui.QMouseEvent) -> None:
-        if self._state == self.State.PRESS:
+        was_press = self._state == self.State.PRESS or self._local_press
+        self._local_press = False
+        if was_press and self.rect().contains(_event.pos()):
             self.clicked.emit()
         self._set_state(
             self.State.HOVER
