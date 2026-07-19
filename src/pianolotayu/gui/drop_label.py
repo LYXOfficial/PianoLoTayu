@@ -24,7 +24,9 @@ class DropLabel(QtWidgets.QLabel):
         PRESS = 3
 
     _ALPHAS = {State.IDLE: 0.0, State.HOVER: 0.05, State.DRAG: 0.14, State.PRESS: 0.14}
-    SUPPORTED_SUFFIXES = {".wav", ".flac", ".mp3", ".ogg", ".m4a", ".mid", ".midi"}
+    SUPPORTED_SUFFIXES = {
+        ".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac", ".mid", ".midi",
+    }
 
     clicked = QtCore.Signal()
     files_dropped = QtCore.Signal(list)  # list[str] of file paths
@@ -113,17 +115,21 @@ class DropLabel(QtWidgets.QLabel):
 
     # ── Events ─────────────────────────────────────────────────────────
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls():
-            paths = _urls_to_paths(event.mimeData().urls())
-            if any(_has_supported_suffix(p) for p in paths):
-                event.acceptProposedAction()
-                self._set_state(self.State.DRAG)
+        # On Windows, urls() may be empty during dragEnter even when
+        # hasUrls() is True — accept optimistically, filter in dropEvent.
+        if _mime_looks_like_files(event.mimeData()):
+            event.setDropAction(QtCore.Qt.DropAction.CopyAction)
+            event.accept()
+            self._set_state(self.State.DRAG)
+        else:
+            event.ignore()
 
     def dragMoveEvent(self, event: QtGui.QDragMoveEvent) -> None:
-        if event.mimeData().hasUrls():
-            paths = _urls_to_paths(event.mimeData().urls())
-            if any(_has_supported_suffix(p) for p in paths):
-                event.acceptProposedAction()
+        if _mime_looks_like_files(event.mimeData()):
+            event.setDropAction(QtCore.Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            event.ignore()
 
     def dragLeaveEvent(self, _event: QtGui.QDragLeaveEvent) -> None:
         self._set_state(self.State.IDLE)
@@ -132,10 +138,14 @@ class DropLabel(QtWidgets.QLabel):
 
     def dropEvent(self, event: QtGui.QDropEvent) -> None:
         self._set_state(self.State.IDLE)
-        paths = [p for p in _urls_to_paths(event.mimeData().urls())
-                 if _has_supported_suffix(p)]
+        paths = paths_from_mime(event.mimeData())
+        paths = [p for p in paths if _has_supported_suffix(p)]
         if paths:
+            event.setDropAction(QtCore.Qt.DropAction.CopyAction)
+            event.accept()
             self.files_dropped.emit(paths)
+        else:
+            event.ignore()
 
     def enterEvent(self, _event: QtCore.QEvent) -> None:
         if self._state not in (self.State.DRAG, self.State.PRESS):
@@ -167,9 +177,91 @@ class DropLabel(QtWidgets.QLabel):
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
+def _mime_looks_like_files(mime: QtCore.QMimeData) -> bool:
+    """True if the mime payload is likely a file drop (Windows-safe)."""
+    if mime is None:
+        return False
+    if mime.hasUrls():
+        # Prefer real path check when available; otherwise accept optimistically
+        paths = paths_from_mime(mime)
+        if not paths:
+            return True
+        return any(_has_supported_suffix(p) for p in paths)
+    # Some shells only expose text/uri-list
+    if mime.hasFormat("text/uri-list"):
+        return True
+    if mime.hasText():
+        text = mime.text().strip()
+        if text.startswith("file:") or Path(text).suffix:
+            return True
+    return False
+
+
+def paths_from_mime(mime: QtCore.QMimeData) -> list[str]:
+    """Extract local file paths from a drop mime payload."""
+    if mime is None:
+        return []
+    paths: list[str] = []
+    if mime.hasUrls():
+        paths.extend(_urls_to_paths(mime.urls()))
+    if not paths and mime.hasFormat("text/uri-list"):
+        raw = bytes(mime.data("text/uri-list")).decode("utf-8", errors="replace")
+        urls = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            urls.append(QtCore.QUrl(line))
+        paths.extend(_urls_to_paths(urls))
+    if not paths and mime.hasText():
+        for line in mime.text().splitlines():
+            line = line.strip().strip('"')
+            if not line:
+                continue
+            if line.startswith("file:"):
+                paths.extend(_urls_to_paths([QtCore.QUrl(line)]))
+            elif Path(line).suffix:
+                paths.append(str(Path(line)))
+    # Dedup preserve order
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in paths:
+        key = p.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
 def _urls_to_paths(urls: list[QtCore.QUrl]) -> list[str]:
-    """Convert a list of QUrl objects to local file paths."""
-    return [u.toLocalFile() for u in urls if u.isLocalFile()]
+    """Convert a list of QUrl objects to local file paths.
+
+    Windows Explorer may hand over ``file:///C:/...`` forms where
+    ``isLocalFile()`` is unreliable, so prefer ``toLocalFile()`` and fall
+    back to a manual path parse.
+    """
+    paths: list[str] = []
+    for u in urls:
+        path = u.toLocalFile()
+        if not path:
+            # PreferLocalFile already decodes percent-encoding
+            s = u.toString(QtCore.QUrl.UrlFormattingOption.PreferLocalFile)
+            if s.startswith("file:"):
+                s = s[5:]
+            # Strip authority: //localhost or ///
+            if s.startswith("//"):
+                # //host/path or ///C:/path
+                rest = s[2:]
+                slash = rest.find("/")
+                s = rest[slash:] if slash >= 0 else rest
+            # Windows drive: /C:/Users/... → C:/Users/...
+            if len(s) >= 3 and s[0] == "/" and s[1].isalpha() and s[2] == ":":
+                s = s[1:]
+            path = s
+        if path:
+            paths.append(str(Path(path)))
+    return paths
 
 
 def _has_supported_suffix(path: str) -> bool:

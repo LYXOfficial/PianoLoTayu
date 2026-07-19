@@ -1,22 +1,55 @@
-"""Windows-specific utilities: taskbar progress bar & focus-beep suppression.
+"""Windows-specific utilities: taskbar progress, beep suppression, fluidsynth DLL.
 
 All classes/functions are safe to import and call on non-Windows platforms —
-they become no-ops so callers don't need platform guards.
+they become no-ops (or return platform-appropriate status) so callers don't
+need platform guards.
 """
 
 from __future__ import annotations
 
 import ctypes
+import os
 import sys
 from ctypes import wintypes, byref, cast, sizeof, POINTER, c_void_p, c_ulong, c_int
+from pathlib import Path
 from typing import Any
 
-from PySide6 import QtWidgets, QtCore
+from PySide6 import QtWidgets, QtCore, QtGui
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Platform guard
 # ═══════════════════════════════════════════════════════════════════════════════
 _IS_WIN32 = sys.platform == "win32"
+
+# Project root icon.png (…/gui/win32_utils.py → parents[3] = repo root)
+_APP_ICON_PATH = Path(__file__).resolve().parents[3] / "icon.png"
+_app_icon_cache: QtGui.QIcon | None = None
+
+
+def app_icon() -> QtGui.QIcon:
+    """Application icon loaded from project-root ``icon.png`` (cached)."""
+    global _app_icon_cache
+    if _app_icon_cache is None:
+        if _APP_ICON_PATH.is_file():
+            _app_icon_cache = QtGui.QIcon(str(_APP_ICON_PATH))
+        else:
+            _app_icon_cache = QtGui.QIcon()  # empty fallback
+    return _app_icon_cache
+
+
+def set_app_user_model_id(app_id: str = "PianoLoTayu") -> None:
+    """Windows: group taskbar entries under our own AppUserModelID.
+
+    Without this, a script launched via ``python.exe`` keeps the Python icon
+    on the taskbar even after ``setWindowIcon``.
+    """
+    if not _IS_WIN32:
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except Exception:
+        pass
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TBPFLAG constants (always defined — used by TaskbarProgress on all platforms)
@@ -231,6 +264,31 @@ if _IS_WIN32:
         ]
 
 
+def _native_msg(message: object):
+    """Dereference a QAbstractNativeEventFilter *message* pointer as MSG.
+
+    PySide6 passes the native pointer as int / sip.voidptr / VoidPtr — not
+    something ``c_void_p()`` always accepts.  ``int(message)`` is the portable
+    way to get the address.
+    """
+    if not _IS_WIN32:
+        return None
+    try:
+        addr = int(message)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        try:
+            # Some bindings expose .__int__ only via asint / asvoidptr
+            addr = int(getattr(message, "asint", lambda: message)())
+        except Exception:
+            return None
+    if not addr:
+        return None
+    try:
+        return cast(addr, POINTER(_MSG)).contents
+    except Exception:
+        return None
+
+
 class BeepSuppressor(QtCore.QAbstractNativeEventFilter):
     """Suppress the Windows system beep when clicking a window that cannot
     receive focus because a modal dialog is active.
@@ -241,15 +299,17 @@ class BeepSuppressor(QtCore.QAbstractNativeEventFilter):
     """
 
     def nativeEventFilter(
-        self, eventType: QtCore.QByteArray, message: int,
+        self, eventType: QtCore.QByteArray, message: object,
     ) -> tuple[bool, int]:
         if not _IS_WIN32:
             return False, 0
-        if eventType != b"windows_generic_MSG":
+        # eventType may be QByteArray or bytes
+        et = bytes(eventType) if not isinstance(eventType, (bytes, bytearray)) else eventType
+        if et != b"windows_generic_MSG":
             return False, 0
 
-        msg = cast(c_void_p(message), POINTER(_MSG)).contents
-        if msg.message != WM_MOUSEACTIVATE:
+        msg = _native_msg(message)
+        if msg is None or msg.message != WM_MOUSEACTIVATE:
             return False, 0
 
         # Only suppress when a modal dialog is stealing focus — clicking
@@ -262,3 +322,285 @@ class BeepSuppressor(QtCore.QAbstractNativeEventFilter):
                 return True, MA_NOACTIVATEANDEAT
 
         return False, 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Elevated-process file drop (WM_DROPFILES across UIPI)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# When the app runs as Administrator and Explorer does not, OLE drag-drop is
+# blocked by UIPI → permanent "prohibited" cursor.  Classic WM_DROPFILES can
+# still work if we:
+#   1. ChangeWindowMessageFilterEx to allow the drop messages in
+#   2. DragAcceptFiles(hwnd, TRUE)
+#   3. Handle WM_DROPFILES and extract paths via DragQueryFileW
+
+if _IS_WIN32:
+    WM_DROPFILES = 0x0233
+    WM_COPYDATA = 0x004A
+    WM_COPYGLOBALDATA = 0x0049  # undocumented but required for HDROP
+    MSGFLT_ALLOW = 1
+
+    class _CHANGEFILTERSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("ExtStatus", wintypes.DWORD),
+        ]
+
+    def _allow_message(hwnd: int, msg: int) -> None:
+        user32 = ctypes.windll.user32
+        cfs = _CHANGEFILTERSTRUCT()
+        cfs.cbSize = sizeof(_CHANGEFILTERSTRUCT)
+        # BOOL ChangeWindowMessageFilterEx(HWND, UINT, DWORD, CHANGEFILTERSTRUCT*)
+        try:
+            user32.ChangeWindowMessageFilterEx(
+                wintypes.HWND(hwnd), wintypes.UINT(msg),
+                wintypes.DWORD(MSGFLT_ALLOW), byref(cfs),
+            )
+        except Exception:
+            # Vista fallback: ChangeWindowMessageFilter(msg, MSGFLT_ADD=1)
+            try:
+                user32.ChangeWindowMessageFilter(wintypes.UINT(msg), 1)
+            except Exception:
+                pass
+
+    def _drag_query_files(hdrop: int) -> list[str]:
+        shell32 = ctypes.windll.shell32
+        shell32.DragQueryFileW.argtypes = [
+            wintypes.HANDLE, wintypes.UINT,
+            wintypes.LPWSTR, wintypes.UINT,
+        ]
+        shell32.DragQueryFileW.restype = wintypes.UINT
+        count = shell32.DragQueryFileW(wintypes.HANDLE(hdrop), 0xFFFFFFFF, None, 0)
+        paths: list[str] = []
+        buf = ctypes.create_unicode_buffer(32768)
+        for i in range(count):
+            n = shell32.DragQueryFileW(
+                wintypes.HANDLE(hdrop), wintypes.UINT(i), buf, 32768,
+            )
+            if n:
+                paths.append(buf.value)
+        try:
+            shell32.DragFinish(wintypes.HANDLE(hdrop))
+        except Exception:
+            pass
+        return paths
+
+
+class ElevatedDropFilter(QtCore.QAbstractNativeEventFilter):
+    """Receive Explorer file drops even when this process is elevated.
+
+    Install after the widget has a native HWND (e.g. in ``showEvent``)::
+
+        filt = enable_elevated_file_drop(window, on_paths)
+        # keep a reference on the window so the filter is not GC'd
+    """
+
+    def __init__(self, callback) -> None:
+        super().__init__()
+        self._callback = callback  # callable(list[str])
+
+    def nativeEventFilter(
+        self, eventType: QtCore.QByteArray, message: object,
+    ) -> tuple[bool, int]:
+        if not _IS_WIN32:
+            return False, 0
+        et = bytes(eventType) if not isinstance(eventType, (bytes, bytearray)) else eventType
+        if et != b"windows_generic_MSG":
+            return False, 0
+        msg = _native_msg(message)
+        if msg is None or msg.message != WM_DROPFILES:
+            return False, 0
+        paths = _drag_query_files(int(msg.wParam))
+        if paths and self._callback is not None:
+            # Defer to Qt event loop so we stay out of the native filter stack
+            QtCore.QTimer.singleShot(0, lambda p=list(paths): self._callback(p))
+        return True, 0
+
+
+def enable_elevated_file_drop(
+    widget: QtWidgets.QWidget, callback,
+) -> ElevatedDropFilter | None:
+    """Allow non-elevated Explorer to drop files onto an elevated *widget*.
+
+    Returns the installed filter (keep a reference), or None on non-Windows /
+    if the HWND is not ready yet.
+    """
+    if not _IS_WIN32:
+        return None
+    hwnd = _get_hwnd(widget)
+    if not hwnd:
+        return None
+    for m in (WM_DROPFILES, WM_COPYDATA, WM_COPYGLOBALDATA):
+        _allow_message(hwnd, m)
+    try:
+        ctypes.windll.shell32.DragAcceptFiles(wintypes.HWND(hwnd), True)
+    except Exception:
+        return None
+    filt = ElevatedDropFilter(callback)
+    app = QtWidgets.QApplication.instance()
+    if app is not None:
+        app.installNativeEventFilter(filt)
+    return filt
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FluidSynth DLL discovery (Windows primarily; Linux/macOS use system packages)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# DLL basenames that pyfluidsynth / FluidSynth ship under
+_FL_DLL_NAMES = (
+    "libfluidsynth-3.dll",
+    "libfluidsynth-2.dll",
+    "libfluidsynth-1.dll",
+    "libfluidsynth.dll",
+    "fluidsynth-3.dll",  # FluidSynth ≥ 2.4.5
+    "fluidsynth-2.dll",
+    "fluidsynth.dll",
+)
+
+_fl_setup_done = False
+_fl_found_dir: Path | None = None
+
+
+def fluidsynth_search_dirs() -> list[Path]:
+    """Directories we scan for the fluidsynth shared library."""
+    dirs: list[Path] = []
+
+    def _add(p: Path | str | None) -> None:
+        if not p:
+            return
+        try:
+            pp = Path(p)
+        except (TypeError, ValueError):
+            return
+        dirs.append(pp)
+
+    # 1. Next to this package / project root
+    here = Path(__file__).resolve()
+    for parent in here.parents[:5]:
+        _add(parent)
+        _add(parent / "bin")
+        _add(parent / "fluidsynth")
+        _add(parent / "fluidsynth" / "bin")
+        _add(parent / "lib")
+
+    # 2. Frozen / installed exe layout
+    _add(Path(sys.executable).parent)
+    _add(Path(sys.executable).parent / "bin")
+    _add(Path(sys.executable).parent / "fluidsynth" / "bin")
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        _add(Path(sys._MEIPASS))  # type: ignore[attr-defined]
+        _add(Path(sys._MEIPASS) / "fluidsynth" / "bin")  # type: ignore[attr-defined]
+
+    # 3. CWD (what pyfluidsynth itself adds via add_dll_directory)
+    _add(Path.cwd())
+    _add(Path.cwd() / "bin")
+    _add(Path.cwd() / "fluidsynth" / "bin")
+
+    # 4. Common install locations
+    _add(Path(r"C:\tools\fluidsynth\bin"))
+    local = os.environ.get("LOCALAPPDATA", "")
+    appdata = os.environ.get("APPDATA", "")
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    for base in (local, appdata, pf, pf86):
+        _add(Path(base) / "fluidsynth" / "bin")
+        _add(Path(base) / "FluidSynth" / "bin")
+
+    # 5. Existing PATH entries (in case DLL is already on PATH but find_library fails)
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        _add(entry)
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    out: list[Path] = []
+    for d in dirs:
+        try:
+            key = str(d.resolve()).lower()
+        except OSError:
+            key = str(d).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+    return out
+
+
+def find_fluidsynth_dir() -> Path | None:
+    """Return the directory containing a fluidsynth DLL, or None."""
+    for d in fluidsynth_search_dirs():
+        try:
+            if not d.is_dir():
+                continue
+        except OSError:
+            continue
+        for name in _FL_DLL_NAMES:
+            if (d / name).is_file():
+                return d
+    return None
+
+
+def setup_fluidsynth_dll() -> Path | None:
+    """Register the fluidsynth DLL directory so pyfluidsynth can load it.
+
+    pyfluidsynth uses ``ctypes.util.find_library``, which on Windows only
+    searches ``PATH`` (not ``os.add_dll_directory``).  We therefore both
+    prepend the directory to ``PATH`` *and* call ``add_dll_directory`` so
+    dependent DLLs (glib, intl, sndfile, …) resolve when ``CDLL`` loads.
+
+    Safe to call multiple times.  Returns the directory found, or None.
+    No-op on non-Windows platforms.
+    """
+    global _fl_setup_done, _fl_found_dir
+    if not _IS_WIN32:
+        return None
+    if _fl_setup_done:
+        return _fl_found_dir
+
+    found = find_fluidsynth_dir()
+    _fl_found_dir = found
+    _fl_setup_done = True
+    if found is None:
+        return None
+
+    dir_s = str(found.resolve())
+    try:
+        os.add_dll_directory(dir_s)
+    except (OSError, AttributeError):
+        pass
+
+    # find_library() only looks at PATH — this is the critical part
+    path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    if not any(p.lower() == dir_s.lower() for p in path_parts if p):
+        os.environ["PATH"] = dir_s + os.pathsep + os.environ.get("PATH", "")
+
+    return found
+
+
+def fluidsynth_status_message() -> str:
+    """Human-readable diagnostics for missing-library errors."""
+    if not _IS_WIN32:
+        return (
+            "未找到 fluidsynth 系统库。\n"
+            "Linux: sudo pacman -S fluidsynth  或  sudo apt install fluidsynth libfluidsynth3\n"
+            "macOS: brew install fluid-synth"
+        )
+    found = find_fluidsynth_dir()
+    if found is not None:
+        return (
+            f"已在以下目录找到 DLL：\n{found}\n"
+            "但仍无法加载（可能缺少依赖 DLL，如 libglib / libintl / libsndfile）。\n"
+            "请把 FluidSynth 发布包 bin 目录下的全部 DLL 一起放进去。"
+        )
+    tried = "\n".join(f"  · {d}" for d in fluidsynth_search_dirs()[:12])
+    return (
+        "未找到 fluidsynth DLL（libfluidsynth-3.dll / fluidsynth-3.dll）。\n\n"
+        "请从 https://github.com/FluidSynth/fluidsynth/releases 下载 Windows 包，\n"
+        "把 bin 目录下的全部 DLL 放到以下任一位置：\n"
+        "  1. 程序 exe 同目录\n"
+        "  2. 程序目录\\fluidsynth\\bin\\\n"
+        "  3. 当前工作目录\n"
+        "  4. C:\\tools\\fluidsynth\\bin\\\n\n"
+        f"已搜索（前几项）：\n{tried}"
+    )

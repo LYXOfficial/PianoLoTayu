@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from PySide6 import QtWidgets, QtGui, QtCore
 
@@ -10,12 +11,23 @@ from .piano_view import (
     MIN_PITCH, MAX_PITCH,
     KeyboardWidget, NoteGridView, MidiPlayer,
 )
-from .export import (
-    VideoExportWorker, AudioExportWorker, filter_available_codecs,
-)
-from .win32_utils import TaskbarProgress
+from .win32_utils import TaskbarProgress, app_icon
+
+if TYPE_CHECKING:
+    from .export import VideoExportWorker, AudioExportWorker
 
 _SOUNDFONT_DIR = Path(__file__).resolve().parents[3] / "soundfonts"
+
+
+def _std_icon(name: str, fallback: QtWidgets.QStyle.StandardPixmap) -> QtGui.QIcon:
+    """Theme icon with QStyle standard-pixmap fallback."""
+    icon = QtGui.QIcon.fromTheme(name)
+    if not icon.isNull():
+        return icon
+    style = QtWidgets.QApplication.style()
+    if style is not None:
+        return style.standardIcon(fallback)
+    return QtGui.QIcon()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -51,6 +63,9 @@ class PianoRollWindow(QtWidgets.QWidget):
         self._base_title = self.windowTitle()
         self.resize(1400, 800)
         self._midi_path = str(midi_path) if midi_path else ""
+        icon = app_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
 
         self._player = MidiPlayer(self)
         self._playing = False
@@ -59,13 +74,21 @@ class PianoRollWindow(QtWidgets.QWidget):
         self._fit_timer: QtCore.QTimer | None = None
         self._fullscreen = False
         self._taskbar = TaskbarProgress(self)
+        self._video_worker = None
+        self._audio_worker = None
 
-        # System-tray icon for cross-platform export-done notifications
+        # System-tray icon only while a notification is showing (Windows needs
+        # a tray icon for balloon toasts; hide it again afterwards).
         self._tray = QtWidgets.QSystemTrayIcon(self)
-        self._tray.setIcon(self.style().standardIcon(
-            QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        if not icon.isNull():
+            self._tray.setIcon(icon)
+        else:
+            self._tray.setIcon(self.style().standardIcon(
+                QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
         self._tray.setToolTip("PianoLoTayu")
-        self._tray.show()
+        self._tray_hide_timer = QtCore.QTimer(self)
+        self._tray_hide_timer.setSingleShot(True)
+        self._tray_hide_timer.timeout.connect(self._hide_tray)
 
         # ── Top controls ────────────────────────────────────────────────
         self._sf_combo = QtWidgets.QComboBox(self)
@@ -76,9 +99,18 @@ class PianoRollWindow(QtWidgets.QWidget):
             self._sf_combo.setCurrentIndex(1)
         self._sf_combo.currentIndexChanged.connect(self._on_sf_changed)
 
-        self._btn_play = QtWidgets.QPushButton("▶ 播放")
-        self._btn_export = QtWidgets.QPushButton("🎬 导出视频")
-        self._btn_export_audio = QtWidgets.QPushButton("🔊 导出音频")
+        self._btn_play = QtWidgets.QPushButton("播放")
+        self._btn_play.setIcon(_std_icon(
+            "media-playback-start",
+            QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self._btn_export = QtWidgets.QPushButton("导出视频")
+        self._btn_export.setIcon(_std_icon(
+            "video-x-generic",
+            QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self._btn_export_audio = QtWidgets.QPushButton("导出音频")
+        self._btn_export_audio.setIcon(_std_icon(
+            "audio-x-generic",
+            QtWidgets.QStyle.StandardPixmap.SP_MediaVolume))
 
         self._mono_cb = QtWidgets.QCheckBox("单色")
         self._mono_color_btn = QtWidgets.QPushButton()
@@ -87,8 +119,10 @@ class PianoRollWindow(QtWidgets.QWidget):
             "background: #de8400; border: 1px solid #999; border-radius: 3px;")
         self._mono_color_btn.clicked.connect(self._on_pick_mono_color)
 
-        self._btn_fullscreen = QtWidgets.QPushButton("⛶ 全屏")
-        self._btn_fullscreen.setMaximumWidth(60)
+        self._btn_fullscreen = QtWidgets.QPushButton("全屏")
+        self._btn_fullscreen.setIcon(_std_icon(
+            "view-fullscreen",
+            QtWidgets.QStyle.StandardPixmap.SP_TitleBarMaxButton))
         self._btn_fullscreen.setToolTip("全屏 (Esc 或双击鼠标退出)")
         self._btn_fullscreen.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
 
@@ -216,11 +250,12 @@ class PianoRollWindow(QtWidgets.QWidget):
         return False
 
     def _on_sf_changed(self, _index: int) -> None:
-        """Hot-swap SoundFont during playback."""
+        """Hot-swap / unload SoundFont (also works mid-playback)."""
         sf = self._sf_combo.currentData() or ""
-        if sf and self._player._synth is not None:
-            sfid = self._player._synth.sfload(sf)
-            self._player._synth.program_select(0, sfid, 0, 0)
+        if not self._player.set_soundfont(sf):
+            if sf:
+                QtWidgets.QMessageBox.warning(
+                    self, "提示", f"无法加载 SoundFont：{sf}")
 
     def _on_fullscreen(self) -> None:
         """Toggle fullscreen: hide controls, show only the piano roll."""
@@ -232,47 +267,106 @@ class PianoRollWindow(QtWidgets.QWidget):
         else:
             self.showNormal()
 
+    def _set_play_button(self, playing: bool) -> None:
+        if playing:
+            self._btn_play.setText("暂停")
+            self._btn_play.setIcon(_std_icon(
+                "media-playback-pause",
+                QtWidgets.QStyle.StandardPixmap.SP_MediaPause))
+        else:
+            self._btn_play.setText("播放")
+            self._btn_play.setIcon(_std_icon(
+                "media-playback-start",
+                QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+
     def _on_play_pause(self) -> None:
         if self._playing:
             self._player.pause()
             self._playing = False
-            self._btn_play.setText("▶ 播放")
+            self._set_play_button(False)
         else:
             if self._midi_path:
                 self._player.load_midi(self._midi_path)
             if self._player._midi is None:
                 QtWidgets.QMessageBox.warning(self, "提示", "没有加载 MIDI 文件")
                 return
-            sf = self._sf_combo.currentData()
-            if sf and self._player._synth is None:
-                if not self._player.load_soundfont(sf):
-                    QtWidgets.QMessageBox.warning(self, "提示",
-                        f"无法加载 SoundFont：{sf}")
+            sf = self._sf_combo.currentData() or ""
+            if sf:
+                if not self._player.set_soundfont(sf):
+                    QtWidgets.QMessageBox.warning(
+                        self, "提示", f"无法加载 SoundFont：{sf}")
                     return
-            elif not sf:
-                QtWidgets.QMessageBox.warning(self, "提示",
-                    "未选择 SoundFont，将静音播放\n请从下拉框中选择一个 .sf2 文件")
-                # continue with silent preview
+            else:
+                # Explicit silent mode — drop any previously loaded synth
+                self._player.unload_soundfont()
             dur = self._grid.scene_duration_s()
             t = self._seek_bar.value() / 1000.0 * dur if dur > 0 else 0.0
-            self._player.play(sf_path=sf or "", start_t=t)
+            self._player.play(sf_path=sf, start_t=t)
             self._playing = True
-            self._btn_play.setText("⏸ 暂停")
+            self._set_play_button(True)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._player.cleanup()
-        for w in ("_video_worker", "_audio_worker"):
-            worker = getattr(self, w, None)
-            if worker is not None:
-                try:
-                    if worker.isRunning():
-                        worker.requestInterruption()
-                        worker.wait(5000)
-                except RuntimeError:
-                    pass  # C++ object already deleted by deleteLater
+        self._stop_worker("_video_worker")
+        self._stop_worker("_audio_worker")
         if self._tray is not None:
+            self._tray_hide_timer.stop()
             self._tray.hide()
         super().closeEvent(event)
+
+    def _hide_tray(self) -> None:
+        if self._tray is not None:
+            self._tray.hide()
+
+    def _notify(self, title: str, body: str, msec: int = 5000) -> None:
+        """Show a system notification; tray icon only visible for the toast."""
+        if self._tray is None:
+            return
+        if not QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self._tray_hide_timer.stop()
+        self._tray.show()
+        self._tray.showMessage(
+            title, body,
+            QtWidgets.QSystemTrayIcon.MessageIcon.Information, msec,
+        )
+        # Keep tray briefly after the toast so the OS can finish showing it
+        self._tray_hide_timer.start(msec + 800)
+
+    def _stop_worker(self, attr: str, timeout_ms: int = 8000) -> None:
+        """Interrupt a QThread attribute and drop the reference only after it stops.
+
+        Avoids ``QThread: Destroyed while thread is still running`` when cancel
+        races with a long render frame / ffmpeg write.
+        """
+        worker = getattr(self, attr, None)
+        if worker is None:
+            return
+        try:
+            # Prevent finished/error from re-entering dialog handlers mid-cancel
+            try:
+                worker.progress.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                worker.finished.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                worker.error.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+
+            if worker.isRunning():
+                worker.requestInterruption()
+                if not worker.wait(timeout_ms):
+                    # Last resort — better than destroying a live QThread
+                    worker.terminate()
+                    worker.wait(2000)
+        except RuntimeError:
+            pass  # C++ object already deleted
+        finally:
+            setattr(self, attr, None)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
@@ -363,7 +457,7 @@ class PianoRollWindow(QtWidgets.QWidget):
 
     def _on_playback_finished(self) -> None:
         self._playing = False
-        self._btn_play.setText("▶ 播放")
+        self._set_play_button(False)
 
     def _on_h_zoom(self, val: int) -> None:
         self._grid.set_h_zoom(val)  # QTransform only, no rebuild in either mode
@@ -388,13 +482,7 @@ class PianoRollWindow(QtWidgets.QWidget):
             self._seek_bar.setValue(int(t / dur * 1000))
         # Auto-scroll: playhead at bottom (vertical) / left edge (horizontal)
         if self._playing and not self._seek_dragging:
-            if self._grid._scene._vertical:
-                view_y = self._grid._view_time_to_y(t)
-                vp_h = self._grid.viewport().height()
-                self._grid.verticalScrollBar().setValue(max(0, int(view_y - vp_h)))
-            else:
-                x = self._grid.time_to_x(t)
-                self._grid.horizontalScrollBar().setValue(int(max(0, x)))
+            self._grid.scroll_to_time(t)
 
     def _on_seek_drag(self, val: int) -> None:
         dur = self._grid.scene_duration_s()
@@ -453,15 +541,6 @@ class PianoRollWindow(QtWidgets.QWidget):
         midi = Path(self._midi_path) if self._midi_path else Path("output")
         path_edit.setText(str(midi.parent / f"{midi.stem}_video.mp4"))
 
-        # Browse
-        _V_FILTERS = "MP4 (*.mp4);;MKV (*.mkv);;WebM (*.webm);;所有文件 (*)"
-        def browse() -> None:
-            p, _ = QtWidgets.QFileDialog.getSaveFileName(
-                dlg, "导出视频", path_edit.text(), _V_FILTERS)
-            if p:
-                path_edit.setText(p)
-        btn_browse.clicked.connect(browse)
-
         # ── Resolution ───────────────────────────────────────────────────
         res_row = QtWidgets.QHBoxLayout()
         res_combo = QtWidgets.QComboBox(dlg)
@@ -479,24 +558,101 @@ class PianoRollWindow(QtWidgets.QWidget):
         fps_row.addWidget(fps_combo, 1)
 
         # ── Codec ────────────────────────────────────────────────────────
+        from .export import build_video_codec_list
         codec_row = QtWidgets.QHBoxLayout()
         codec_combo = QtWidgets.QComboBox(dlg)
-        # (label, codec, container_ext)
-        _ALL_CODECS = [
-            ("H.264 (.mp4)",  "libx264", ".mp4"),
-            ("H.265 (.mp4)",  "libx265", ".mp4"),
-            ("AV1 (.mp4)",    "libsvtav1", ".mp4"),
-            ("H.264 (.mkv)",  "libx264", ".mkv"),
-            ("H.265 (.mkv)",  "libx265", ".mkv"),
-            ("AV1 (.webm)",   "libsvtav1", ".webm"),
-        ]
-        # Filter to encoders actually available in ffmpeg
-        _CODECS = filter_available_codecs(_ALL_CODECS)
+        # (label, codec, container_ext) — AV1 resolves to libaom/SVT/rav1e
+        _CODECS = build_video_codec_list()
+        if not _CODECS:
+            _CODECS = [("H.264 (.mp4)", "libx264", ".mp4")]
         for label, *_ in _CODECS:
             codec_combo.addItem(label)
         codec_combo.setCurrentIndex(0)
         codec_row.addWidget(QtWidgets.QLabel("编码:"))
         codec_row.addWidget(codec_combo, 1)
+
+        # ── Path ↔ codec extension sync ──────────────────────────────────
+        _V_FILTERS = "MP4 (*.mp4);;MKV (*.mkv);;WebM (*.webm);;所有文件 (*)"
+        _syncing = {"on": False}  # re-entrancy guard
+
+        def _path_with_ext(path: str, ext: str) -> str:
+            p = Path(path)
+            if not ext.startswith("."):
+                ext = f".{ext}"
+            stem = p.stem if p.suffix else p.name
+            if not stem:
+                stem = "output"
+            return str(p.with_name(stem + ext))
+
+        def _ext_of(path: str) -> str:
+            return Path(path).suffix.lower()
+
+        def _set_path_for_codec(idx: int) -> None:
+            if idx < 0 or idx >= len(_CODECS):
+                return
+            ext = _CODECS[idx][2]
+            cur = path_edit.text().strip()
+            if not cur:
+                m = Path(self._midi_path) if self._midi_path else Path("output")
+                cur = str(m.parent / f"{m.stem}_video{ext}")
+            else:
+                cur = _path_with_ext(cur, ext)
+            if path_edit.text() != cur:
+                path_edit.setText(cur)
+            _refill_audio_codecs(cur)
+
+        def _set_codec_for_path(path: str) -> None:
+            ext = _ext_of(path)
+            if not ext:
+                return
+            cur_i = codec_combo.currentIndex()
+            if 0 <= cur_i < len(_CODECS) and _CODECS[cur_i][2] == ext:
+                _refill_audio_codecs(path)
+                return
+            for i, (_label, _enc, cext) in enumerate(_CODECS):
+                if cext == ext:
+                    codec_combo.setCurrentIndex(i)
+                    break
+            _refill_audio_codecs(path)
+
+        def browse() -> None:
+            cur_i = codec_combo.currentIndex()
+            selected_filter = _V_FILTERS
+            if 0 <= cur_i < len(_CODECS):
+                parts = _V_FILTERS.split(";;")
+                needle = f"*.{_CODECS[cur_i][2].lstrip('.')}"
+                preferred = next(
+                    (p for p in parts if needle in p.lower()), None,
+                )
+                if preferred is not None:
+                    selected_filter = ";;".join(
+                        [preferred] + [p for p in parts if p != preferred]
+                    )
+            p, _ = QtWidgets.QFileDialog.getSaveFileName(
+                dlg, "导出视频", path_edit.text(), selected_filter)
+            if p:
+                if not Path(p).suffix and 0 <= cur_i < len(_CODECS):
+                    p = _path_with_ext(p, _CODECS[cur_i][2])
+                _syncing["on"] = True
+                try:
+                    path_edit.setText(p)
+                    _set_codec_for_path(p)
+                finally:
+                    _syncing["on"] = False
+
+        btn_browse.clicked.connect(browse)
+
+        def _on_codec_changed(idx: int) -> None:
+            if _syncing["on"]:
+                return
+            _syncing["on"] = True
+            try:
+                _set_path_for_codec(idx)
+            finally:
+                _syncing["on"] = False
+
+        codec_combo.currentIndexChanged.connect(_on_codec_changed)
+        # Path/codec default alignment runs after audio-codec UI is created
 
         # ── SoundFont ────────────────────────────────────────────────────
         sf_row = QtWidgets.QHBoxLayout()
@@ -547,12 +703,49 @@ class PianoRollWindow(QtWidgets.QWidget):
         style_row.addStretch()
 
         a_br_row = QtWidgets.QHBoxLayout()
+        a_codec_combo = QtWidgets.QComboBox(dlg)
         a_br_combo = QtWidgets.QComboBox(dlg)
         a_br_combo.setEditable(True)
         a_br_combo.addItems(["96", "128", "192", "256", "320"])
         a_br_combo.setCurrentIndex(2)
-        a_br_row.addWidget(QtWidgets.QLabel("音频码率 (kbps):"))
+        a_br_row.addWidget(QtWidgets.QLabel("音频编码:"))
+        a_br_row.addWidget(a_codec_combo, 1)
+        a_br_row.addWidget(QtWidgets.QLabel("码率 (kbps):"))
         a_br_row.addWidget(a_br_combo, 1)
+
+        def _refill_audio_codecs(path: str, keep_id: str | None = None) -> None:
+            """Rebuild audio-codec list for the container of *path*."""
+            from .export import audio_codecs_for_path
+            opts = audio_codecs_for_path(path)
+            prev = keep_id
+            if prev is None and a_codec_combo.count():
+                prev = a_codec_combo.currentData()
+            a_codec_combo.blockSignals(True)
+            a_codec_combo.clear()
+            for label, cid in opts:
+                a_codec_combo.addItem(label, cid)
+            # restore previous selection if still valid
+            idx = a_codec_combo.findData(prev) if prev else -1
+            a_codec_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            a_codec_combo.blockSignals(False)
+            # FLAC ignores bitrate
+            is_flac = (a_codec_combo.currentData() or "") == "flac"
+            a_br_combo.setEnabled(not is_flac and not mute_cb.isChecked())
+
+        def _on_a_codec_changed(_idx: int = 0) -> None:
+            is_flac = (a_codec_combo.currentData() or "") == "flac"
+            a_br_combo.setEnabled(not is_flac and not mute_cb.isChecked())
+
+        a_codec_combo.currentIndexChanged.connect(_on_a_codec_changed)
+        # Align default path with codec, then fill audio options for that container
+        _set_path_for_codec(codec_combo.currentIndex())
+
+        def _on_mute_toggled(checked: bool) -> None:
+            a_codec_combo.setEnabled(not checked)
+            is_flac = (a_codec_combo.currentData() or "") == "flac"
+            a_br_combo.setEnabled(not checked and not is_flac)
+
+        mute_cb.toggled.connect(_on_mute_toggled)
 
         # ── Video bitrate ────────────────────────────────────────────────
         v_br_row = QtWidgets.QHBoxLayout()
@@ -602,7 +795,7 @@ class PianoRollWindow(QtWidgets.QWidget):
         _export_widgets = [
             path_edit, btn_browse, res_combo, fps_combo, codec_combo,
             sf_combo_export, mute_cb, vertical_cb, mono_cb, mono_color_btn,
-            a_br_combo, v_br_combo, btn_do,
+            a_codec_combo, a_br_combo, v_br_combo, btn_do,
         ]
 
         def do_export() -> None:
@@ -619,6 +812,7 @@ class PianoRollWindow(QtWidgets.QWidget):
             _codec = _CODECS[_ci][1]
             res_w, res_h = [(1920, 1080), (1280, 720), (854, 480)][res_combo.currentIndex()]
             fps = int(fps_combo.currentText())
+            a_codec_id = a_codec_combo.currentData() or "aac"
             for w in _export_widgets:
                 w.setEnabled(False)
             btn_cancel.setEnabled(True)
@@ -626,10 +820,12 @@ class PianoRollWindow(QtWidgets.QWidget):
             pbar.setValue(0)
             status_label.setVisible(True)
 
+            from .export import VideoExportWorker
             self._video_worker = VideoExportWorker(
                 self._midi_path, sf if not mute_cb.isChecked() else "", out,
                 fps=fps, width=res_w, height=res_h,
                 v_codec=_codec, v_bitrate=v_br_combo.currentText().strip(),
+                a_codec=a_codec_id,
                 a_bitrate=a_br_combo.currentText().strip() + "k",
                 muted=mute_cb.isChecked(),
                 vertical=vertical_cb.isChecked(),
@@ -669,11 +865,7 @@ class PianoRollWindow(QtWidgets.QWidget):
         # ── Cancel / close handling ─────────────────────────────────────
         def _cancel_export() -> None:
             """Interrupt worker and re-enable controls (dialog stays open)."""
-            if (self._video_worker is not None
-                    and self._video_worker.isRunning()):
-                self._video_worker.requestInterruption()
-                self._video_worker.wait(5000)
-                self._video_worker = None
+            self._stop_worker("_video_worker")
             for w in _export_widgets:
                 w.setEnabled(True)
             btn_do.setEnabled(True)
@@ -693,15 +885,11 @@ class PianoRollWindow(QtWidgets.QWidget):
         dlg.exec()
 
     def _on_video_done(self, dlg: QtWidgets.QDialog, output: str) -> None:
-        if self._video_worker is not None:
-            self._video_worker.wait(5000)
-            self._video_worker = None
+        self._stop_worker("_video_worker")
         dlg.accept()
         if not self.isActiveWindow():
             QtWidgets.QApplication.alert(self, 0)
-        self._tray.showMessage(
-            "导出完成", f"视频已保存至：\n{output}",
-            QtWidgets.QSystemTrayIcon.MessageIcon.Information, 5000)
+        self._notify("导出完成", f"视频已保存至：\n{output}")
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("导出完成")
         box.setText(f"视频已保存至：\n{output}")
@@ -719,10 +907,13 @@ class PianoRollWindow(QtWidgets.QWidget):
                 QtCore.QUrl.fromLocalFile(str(Path(output).parent)))
 
     def _on_video_error(self, dlg: QtWidgets.QDialog, msg: str) -> None:
-        if self._video_worker is not None:
-            self._video_worker.wait(5000)
-            self._video_worker = None
+        self._stop_worker("_video_worker")
         self._taskbar.hide()
+        # Disconnect rejected→cancel first to avoid double-stop / re-enable race
+        try:
+            dlg.rejected.disconnect()
+        except (RuntimeError, TypeError):
+            pass
         dlg.reject()
         QtWidgets.QMessageBox.critical(self, "导出失败", f"视频导出失败：\n{msg}")
 
@@ -731,7 +922,7 @@ class PianoRollWindow(QtWidgets.QWidget):
         """Open a dialog to configure audio export, then start rendering."""
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("导出音频")
-        dlg.setMinimumWidth(240)
+        dlg.setMinimumWidth(300)
         # ── Output path ──────────────────────────────────────────────────
         path_row = QtWidgets.QHBoxLayout()
         path_edit = QtWidgets.QLineEdit(dlg)
@@ -742,10 +933,30 @@ class PianoRollWindow(QtWidgets.QWidget):
         path_row.addWidget(path_edit)
         path_row.addWidget(btn_browse)
 
-        # Default output path (format chosen via file dialog extension)
+        # (label, codec_id, extension) — grouped by container, preferred codec first
+        _ALL_FORMATS: list[tuple[str, str, str]] = [
+            ("MP3 (.mp3)",        "mp3",    ".mp3"),
+            ("AAC ADTS (.aac)",   "aac",    ".aac"),
+            ("AAC (.m4a)",        "aac",    ".m4a"),
+            ("Opus (.m4a)",       "opus",   ".m4a"),
+            ("Vorbis (.ogg)",     "vorbis", ".ogg"),
+            ("Opus (.ogg)",       "opus",   ".ogg"),
+            ("FLAC (.flac)",      "flac",   ".flac"),
+            ("WAV (.wav)",        "pcm",    ".wav"),
+        ]
+        # Keep only formats whose encoder exists
+        from .export import standalone_audio_codecs_for_path
+        _FORMATS = [
+            (lab, cid, ext) for lab, cid, ext in _ALL_FORMATS
+            if any(c == cid for _, c in standalone_audio_codecs_for_path(f"x{ext}"))
+            or cid == "pcm"
+        ]
+        if not _FORMATS:
+            _FORMATS = [("MP3 (.mp3)", "mp3", ".mp3")]
+
         _FILTERS = (
-            "mp3 (*.mp3);;m4a (*.m4a);;wav (*.wav);;"
-            "flac (*.flac);;ogg (*.ogg);;所有文件 (*)"
+            "MP3 (*.mp3);;AAC (*.aac);;M4A (*.m4a);;OGG (*.ogg);;"
+            "FLAC (*.flac);;WAV (*.wav);;所有文件 (*)"
         )
 
         # ── SoundFont ────────────────────────────────────────────────────
@@ -758,14 +969,92 @@ class PianoRollWindow(QtWidgets.QWidget):
         sf_row.addWidget(QtWidgets.QLabel("SoundFont:"))
         sf_row.addWidget(sf_combo, 1)
 
-        # ── Bitrate (raw number, no "k" suffix) ──────────────────────────
-        br_row = QtWidgets.QHBoxLayout()
+        # ── Codec + bitrate ──────────────────────────────────────────────
+        codec_br_row = QtWidgets.QHBoxLayout()
+        a_codec_combo = QtWidgets.QComboBox(dlg)
+        for lab, cid, ext in _FORMATS:
+            # userData: (codec_id, extension)
+            a_codec_combo.addItem(lab, (cid, ext))
         br_combo = QtWidgets.QComboBox(dlg)
         br_combo.setEditable(True)
         br_combo.addItems(["96", "128", "192", "256", "320"])
         br_combo.setCurrentIndex(2)
-        br_row.addWidget(QtWidgets.QLabel("码率 (kbps):"))
-        br_row.addWidget(br_combo, 1)
+        codec_br_row.addWidget(QtWidgets.QLabel("编码:"))
+        codec_br_row.addWidget(a_codec_combo, 1)
+        codec_br_row.addWidget(QtWidgets.QLabel("码率 (kbps):"))
+        codec_br_row.addWidget(br_combo, 1)
+
+        _sync = {"on": False}
+
+        def _path_with_ext(path: str, ext: str) -> str:
+            p = Path(path)
+            if not ext.startswith("."):
+                ext = f".{ext}"
+            stem = p.stem if p.suffix else p.name
+            if not stem:
+                stem = "output"
+            return str(p.with_name(stem + ext))
+
+        def _current_format() -> tuple[str, str]:
+            data = a_codec_combo.currentData()
+            if isinstance(data, tuple) and len(data) == 2:
+                return str(data[0]), str(data[1])
+            return "mp3", ".mp3"
+
+        def _update_br_enabled() -> None:
+            cid, _ext = _current_format()
+            br_combo.setEnabled(cid not in ("flac", "pcm"))
+
+        def _set_path_for_format() -> None:
+            """Always rewrite path suffix to match the selected format."""
+            _cid, ext = _current_format()
+            cur = path_edit.text().strip()
+            if not cur:
+                midi = Path(self._midi_path) if self._midi_path else Path("output")
+                cur = str(midi.parent / f"{midi.stem}_midi{ext}")
+            else:
+                cur = _path_with_ext(cur, ext)
+            if path_edit.text() != cur:
+                path_edit.setText(cur)
+            _update_br_enabled()
+
+        def _set_format_for_path(path: str) -> None:
+            """Pick the format entry matching path's extension (keep codec if possible)."""
+            ext = Path(path).suffix.lower()
+            if not ext:
+                return
+            cur_i = a_codec_combo.currentIndex()
+            cur_data = a_codec_combo.itemData(cur_i)
+            # Prefer keeping same codec_id if that ext supports it
+            if isinstance(cur_data, tuple) and cur_data[1] == ext:
+                return
+            prefer_cid = cur_data[0] if isinstance(cur_data, tuple) else None
+            best = -1
+            for i in range(a_codec_combo.count()):
+                d = a_codec_combo.itemData(i)
+                if not isinstance(d, tuple):
+                    continue
+                if d[1] != ext:
+                    continue
+                if prefer_cid and d[0] == prefer_cid:
+                    best = i
+                    break
+                if best < 0:
+                    best = i
+            if best >= 0 and best != a_codec_combo.currentIndex():
+                a_codec_combo.setCurrentIndex(best)
+            _update_br_enabled()
+
+        def _on_codec_changed(_idx: int = 0) -> None:
+            if _sync["on"]:
+                return
+            _sync["on"] = True
+            try:
+                _set_path_for_format()
+            finally:
+                _sync["on"] = False
+
+        a_codec_combo.currentIndexChanged.connect(_on_codec_changed)
 
         # ── Buttons ──────────────────────────────────────────────────────
         btn_row = QtWidgets.QHBoxLayout()
@@ -787,7 +1076,7 @@ class PianoRollWindow(QtWidgets.QWidget):
         form = QtWidgets.QVBoxLayout(dlg)
         form.addLayout(path_row)
         form.addLayout(sf_row)
-        form.addLayout(br_row)
+        form.addLayout(codec_br_row)
         form.addWidget(status_label)
         form.addWidget(pbar)
         form.addLayout(btn_row)
@@ -795,21 +1084,51 @@ class PianoRollWindow(QtWidgets.QWidget):
         # ── Browse ───────────────────────────────────────────────────────
         def browse() -> None:
             midi = Path(self._midi_path) if self._midi_path else Path("output")
-            default = str(midi.parent / f"{midi.stem}_midi.mp3")
+            default = path_edit.text().strip() or str(
+                midi.parent / f"{midi.stem}_midi.mp3")
+            # Prefer filter matching current format extension
+            selected = _FILTERS
+            _cid, cur_ext = _current_format()
+            parts = _FILTERS.split(";;")
+            needle = f"*{cur_ext}"
+            preferred = next(
+                (p for p in parts if needle in p.lower()), None,
+            )
+            if preferred is not None:
+                selected = ";;".join(
+                    [preferred] + [p for p in parts if p != preferred]
+                )
             p, _ = QtWidgets.QFileDialog.getSaveFileName(
-                dlg, "导出音频", default, _FILTERS)
+                dlg, "导出音频", default, selected)
             if p:
-                path_edit.setText(p)
+                if not Path(p).suffix:
+                    p = _path_with_ext(p, cur_ext)
+                _sync["on"] = True
+                try:
+                    path_edit.setText(p)
+                    _set_format_for_path(p)
+                finally:
+                    _sync["on"] = False
 
         btn_browse.clicked.connect(browse)
-        # auto-fill default (absolute path, same folder as MIDI)
+
+        # Default path + align with default format (index 0 = MP3)
         if self._midi_path and not path_edit.text():
             midi = Path(self._midi_path)
             path_edit.setText(str(midi.parent / f"{midi.stem}_midi.mp3"))
+        _sync["on"] = True
+        try:
+            # If path already has an ext, select matching format first
+            if path_edit.text().strip():
+                _set_format_for_path(path_edit.text().strip())
+            _set_path_for_format()
+        finally:
+            _sync["on"] = False
 
         # ── Export ───────────────────────────────────────────────────────
         _audio_export_widgets = [
-            path_edit, btn_browse, sf_combo, br_combo, btn_export_dlg,
+            path_edit, btn_browse, sf_combo, a_codec_combo, br_combo,
+            btn_export_dlg,
         ]
 
         def do_export() -> None:
@@ -827,6 +1146,11 @@ class PianoRollWindow(QtWidgets.QWidget):
             if not self._midi_path:
                 QtWidgets.QMessageBox.warning(dlg, "提示", "没有 MIDI 文件")
                 return
+            a_codec_id, fmt_ext = _current_format()
+            # Force path extension to match selected format
+            if Path(out).suffix.lower() != fmt_ext:
+                out = _path_with_ext(out, fmt_ext)
+                path_edit.setText(out)
 
             for w in _audio_export_widgets:
                 w.setEnabled(False)
@@ -837,9 +1161,11 @@ class PianoRollWindow(QtWidgets.QWidget):
             pbar.setValue(0)
             self._taskbar.show_indeterminate()
 
+            from .export import AudioExportWorker
             self._audio_worker = AudioExportWorker(
                 self._midi_path, sf, out,
                 bitrate=br_combo.currentText().strip() + "k",
+                a_codec=a_codec_id,
             )
             def _on_audio_prog(msg: str, pct: int) -> None:
                 status_label.setText(msg)
@@ -847,7 +1173,6 @@ class PianoRollWindow(QtWidgets.QWidget):
                 if pct >= 0:
                     pbar.setVisible(True)
                     pbar.setValue(pct)
-                if pct >= 0:
                     self._taskbar.show_normal(pct)
             self._audio_worker.progress.connect(_on_audio_prog)
             self._audio_worker.finished.connect(
@@ -857,14 +1182,10 @@ class PianoRollWindow(QtWidgets.QWidget):
             self._audio_worker.start()
 
         btn_export_dlg.clicked.connect(do_export)
-        btn_cancel.setEnabled(False)  # disabled until export starts
+        btn_cancel.setEnabled(False)
 
         def _cancel_audio_export() -> None:
-            if (self._audio_worker is not None
-                    and self._audio_worker.isRunning()):
-                self._audio_worker.requestInterruption()
-                self._audio_worker.wait(5000)
-                self._audio_worker = None
+            self._stop_worker("_audio_worker")
             for w in _audio_export_widgets:
                 w.setEnabled(True)
             btn_export_dlg.setEnabled(True)
@@ -881,16 +1202,11 @@ class PianoRollWindow(QtWidgets.QWidget):
         dlg.exec()
 
     def _on_audio_export_done(self, dlg: QtWidgets.QDialog, output: str) -> None:
-        if self._audio_worker is not None:
-            self._audio_worker.wait(5000)
-            self._audio_worker = None
+        self._stop_worker("_audio_worker")
         self._taskbar.hide()
         dlg.accept()
-        if not self.isActiveWindow():
-            QtWidgets.QApplication.alert(self, 0)
-        self._tray.showMessage(
-            "导出完成", f"音频已保存至：\n{output}",
-            QtWidgets.QSystemTrayIcon.MessageIcon.Information, 5000)
+        QtWidgets.QApplication.alert(self, 0)
+        self._notify("导出完成", f"音频已保存至：\n{output}")
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("导出完成")
         box.setText(f"音频已保存至：\n{output}")
@@ -908,10 +1224,12 @@ class PianoRollWindow(QtWidgets.QWidget):
                 QtCore.QUrl.fromLocalFile(str(Path(output).parent)))
 
     def _on_audio_export_error(self, dlg: QtWidgets.QDialog, msg: str) -> None:
-        if self._audio_worker is not None:
-            self._audio_worker.wait(5000)
-            self._audio_worker = None
+        self._stop_worker("_audio_worker")
         self._taskbar.hide()
+        try:
+            dlg.rejected.disconnect()
+        except (RuntimeError, TypeError):
+            pass
         dlg.reject()
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("导出失败")
