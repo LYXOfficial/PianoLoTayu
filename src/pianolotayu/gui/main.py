@@ -28,11 +28,11 @@ if not _QPA_PLATFORMTHEME and os.environ.get("XDG_CURRENT_DESKTOP", "").lower() 
 from PySide6 import QtWidgets, QtGui, QtCore
 from .ui_main import Ui_Form
 from .drop_label import DropLabel
-from .win32_utils import TaskbarProgress, BeepSuppressor
+from .win32_utils import (
+    TaskbarProgress, BeepSuppressor, app_icon, set_app_user_model_id,
+    enable_elevated_file_drop,
+)
 from ..config import DEFAULTS, VERSION
-from ..convert.audio import load_audio, compute_stft
-from ..convert.analysis import analyze_frames
-from ..convert.midi_writer import create_midi, save_midi
 import traceback
 
 # Tooltips — hard-coded Chinese for now (i18n later)
@@ -55,7 +55,7 @@ _HINT_TEXT = (
     '<span style="font-size:10pt; color: #888;">'
     "拖拽文件至此处或点击打开文件</span><br>"
     '<span style="font-size:9pt; color: #aaa;">'
-    "支持格式：wav, flac, mp3, ogg, m4a,</span><br/>"
+    "支持格式：wav, flac, mp3, ogg, m4a, aac,</span><br/>"
     '<span style="font-size:9pt; color: #aaa;">'
     "mid, midi（仅预览）</span>"
 )
@@ -72,8 +72,10 @@ def _swap_widget(old: QtWidgets.QWidget, new: QtWidgets.QWidget) -> None:
     if layout is not None:
         idx = layout.indexOf(old)
         if idx >= 0:
+            layout.removeWidget(old)
             layout.insertWidget(idx, new)
     old.hide()
+    old.setParent(None)
     old.deleteLater()
 
 
@@ -134,6 +136,11 @@ class ConversionWorker(QtCore.QThread):
 
     def run(self) -> None:
         try:
+            # Heavy deps (numpy/librosa/scipy) only when converting
+            from ..convert.audio import load_audio, compute_stft
+            from ..convert.analysis import analyze_frames
+            from ..convert.midi_writer import create_midi, save_midi
+
             self.progress.emit(5)
             if self.isInterruptionRequested():
                 return
@@ -188,10 +195,26 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
         self.retranslateUi(self)
         self._worker: ConversionWorker | None = None
         self._taskbar = TaskbarProgress(self)
+        self._elevated_drop_filter = None  # keep alive for WM_DROPFILES
         self._init_drop_area()
         self._init_io()
         self._init_convert()
         self._bind_defaults()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        # HWND exists after first show — enable admin←Explorer file drops
+        if self._elevated_drop_filter is None:
+            def _on_elevated_drop(paths: list[str]) -> None:
+                ok = [
+                    p for p in paths
+                    if Path(p).suffix.lower() in DropLabel.SUPPORTED_SUFFIXES
+                ]
+                if ok:
+                    self._on_files_selected(ok)
+            self._elevated_drop_filter = enable_elevated_file_drop(
+                self, _on_elevated_drop,
+            )
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self._worker is not None:
@@ -215,7 +238,7 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
         self.drop_area.files_dropped.connect(self._on_files_selected)
 
     # ── File / output path ──────────────────────────────────────────────
-    _FILTER = ("音频文件 (*.wav *.flac *.mp3 *.ogg *.m4a);;"
+    _FILTER = ("音频文件 (*.wav *.flac *.mp3 *.ogg *.m4a *.aac);;"
                "MIDI 文件 (*.mid *.midi);;所有文件 (*)")
 
     def _init_io(self) -> None:
@@ -464,9 +487,23 @@ class PianoLoTayu(Ui_Form, QtWidgets.QWidget):
 def main() -> int:
     import signal
 
+    # Windows: own taskbar identity (must be before QApplication)
+    set_app_user_model_id("PianoLoTayu")
+
+    # Register fluidsynth DLL dir *before* any import of pyfluidsynth.
+    # Must run early so PATH / add_dll_directory are in place.
+    try:
+        from .win32_utils import setup_fluidsynth_dll
+        setup_fluidsynth_dll()
+    except Exception:
+        pass
+
     app = QtWidgets.QApplication()
     app.setApplicationName("PianoLoTayu")
     app.setOrganizationName("PianoLoTayu")
+    icon = app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
 
     # ── Suppress Windows beep when clicking outside a modal dialog ────────
     app.installNativeEventFilter(BeepSuppressor())
@@ -485,6 +522,8 @@ def main() -> int:
     app.setFont(sys_font)
 
     window = PianoLoTayu()
+    if not icon.isNull():
+        window.setWindowIcon(icon)
     window.show()
     app.exec()
     return 0
