@@ -87,7 +87,7 @@ jobs:
 
       # ── Linux system deps ──────────────────────────────────────────────────
       - name: Install Linux system packages
-        if: matrix.target_os == 'linux' && matrix.qemu != true
+        if: matrix.target_os == 'linux'
         run: |
           set -euxo pipefail
           sudo apt-get update
@@ -129,7 +129,6 @@ jobs:
           fluidsynth --version || true
 
       - name: Set up uv (host)
-        if: matrix.qemu != true
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -157,7 +156,7 @@ jobs:
 
       # ── Build ──────────────────────────────────────────────────────────────
       - name: make package (Linux)
-        if: matrix.target_os == 'linux' && matrix.qemu != true
+        if: matrix.target_os == 'linux'
         run: |
           set -euxo pipefail
           uv --version
@@ -186,8 +185,28 @@ jobs:
           ls -lah build/entry.dist/ | head -40
 
       # ── Zip ────────────────────────────────────────────────────────────────
-      - name: Create zip
-        shell: bash
+      - name: Create zip (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          set -euxo pipefail
+          NAME="${ARTIFACT}"
+          mkdir -p "out/${NAME}"
+          if [[ ! -d build/entry.dist ]]; then
+            echo "missing build/entry.dist" >&2
+            ls -la build || true
+            exit 1
+          fi
+          cp -a build/entry.dist/. "out/${NAME}/"
+          rm -f "out/${NAME}"/nuitka-crash-report.xml || true
+          (
+            cd out
+            zip -r -9 "../${NAME}.zip" "${NAME}"
+          )
+          ls -lh "${NAME}.zip"
+
+      - name: Create zip (Windows)
+        if: matrix.target_os == 'windows'
+        shell: msys2 {0}
         run: |
           set -euxo pipefail
           NAME="${ARTIFACT}"
