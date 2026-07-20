@@ -39,13 +39,13 @@ jobs:
             V="${GITHUB_REF_NAME#v}"
           else
             V="$(python3 - <<'PY'
-import re, pathlib
-text = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
-m = re.search(r'(?m)^version\s*=\s*["\']([^"\']+)["\']', text)
-assert m, "version not found in pyproject.toml"
-print(m.group(1))
-PY
-)"
+          import re, pathlib
+          text = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          m = re.search(r'(?m)^version\s*=\s*["\']([^"\']+)["\']', text)
+          assert m, "version not found in pyproject.toml"
+          print(m.group(1))
+          PY
+          )"
           fi
           echo "version=${V}" >> "$GITHUB_OUTPUT"
           echo "Resolved version: ${V}"
