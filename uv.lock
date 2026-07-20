@@ -186,14 +186,12 @@ dependencies = [
     { name = "pyfluidsynth" },
     { name = "pyside6" },
     { name = "soundfile" },
+    { name = "soxr" },
 ]
 
 [package.optional-dependencies]
 dev = [
     { name = "nuitka" },
-]
-speed = [
-    { name = "soxr" },
 ]
 
 [package.metadata]
@@ -205,9 +203,9 @@ requires-dist = [
     { name = "pyfluidsynth", specifier = ">=1.4.0" },
     { name = "pyside6", specifier = ">=6.11.1" },
     { name = "soundfile", specifier = ">=0.14.0" },
-    { name = "soxr", marker = "extra == 'speed'", specifier = ">=0.5.0" },
+    { name = "soxr", specifier = ">=0.5.0" },
 ]
-provides-extras = ["dev", "speed"]
+provides-extras = ["dev"]
 
 [[package]]
 name = "pretty-midi"

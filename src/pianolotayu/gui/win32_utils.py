@@ -1242,7 +1242,11 @@ _fl_found_dir: Path | None = None
 
 
 def fluidsynth_search_dirs() -> list[Path]:
-    """Directories we scan for the fluidsynth shared library."""
+    """Directories we scan for the fluidsynth shared library.
+
+    Only flat roots — put the release ``bin/*`` DLLs next to the exe / CWD.
+    No nested ``bin/`` / ``lib/`` / ``fluidsynth/bin`` probing.
+    """
     dirs: list[Path] = []
 
     def _add(p: Path | str | None) -> None:
@@ -1254,39 +1258,20 @@ def fluidsynth_search_dirs() -> list[Path]:
             return
         dirs.append(pp)
 
-    # 1. Next to this package / project root
+    # 1. Package / project ancestors (dev: …/src/pianolotayu/gui → parents)
     here = Path(__file__).resolve()
     for parent in here.parents[:5]:
         _add(parent)
-        _add(parent / "bin")
-        _add(parent / "fluidsynth")
-        _add(parent / "fluidsynth" / "bin")
-        _add(parent / "lib")
 
-    # 2. Frozen / installed exe layout
+    # 2. Frozen / installed exe directory (+ PyInstaller extract dir if any)
     _add(Path(sys.executable).parent)
-    _add(Path(sys.executable).parent / "bin")
-    _add(Path(sys.executable).parent / "fluidsynth" / "bin")
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         _add(Path(sys._MEIPASS))  # type: ignore[attr-defined]
-        _add(Path(sys._MEIPASS) / "fluidsynth" / "bin")  # type: ignore[attr-defined]
 
-    # 3. CWD (what pyfluidsynth itself adds via add_dll_directory)
+    # 3. CWD
     _add(Path.cwd())
-    _add(Path.cwd() / "bin")
-    _add(Path.cwd() / "fluidsynth" / "bin")
 
-    # 4. Common install locations
-    _add(Path(r"C:\tools\fluidsynth\bin"))
-    local = os.environ.get("LOCALAPPDATA", "")
-    appdata = os.environ.get("APPDATA", "")
-    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
-    pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
-    for base in (local, appdata, pf, pf86):
-        _add(Path(base) / "fluidsynth" / "bin")
-        _add(Path(base) / "FluidSynth" / "bin")
-
-    # 5. Existing PATH entries (in case DLL is already on PATH but find_library fails)
+    # 4. PATH entries (find_library only looks here; useful if user installed FS)
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         _add(entry)
 
@@ -1375,10 +1360,8 @@ def fluidsynth_status_message() -> str:
     return (
         "未找到 fluidsynth DLL（libfluidsynth-3.dll / fluidsynth-3.dll）。\n\n"
         "请从 https://github.com/FluidSynth/fluidsynth/releases 下载 Windows 包，\n"
-        "把 bin 目录下的全部 DLL 放到以下任一位置：\n"
-        "  1. 程序 exe 同目录\n"
-        "  2. 程序目录\\fluidsynth\\bin\\\n"
-        "  3. 当前工作目录\n"
-        "  4. C:\\tools\\fluidsynth\\bin\\\n\n"
+        "把 bin 目录下的全部 DLL 放到：\n"
+        "  · 程序 exe 同目录，或\n"
+        "  · 当前工作目录\n\n"
         f"已搜索（前几项）：\n{tried}"
     )
