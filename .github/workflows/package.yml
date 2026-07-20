@@ -31,7 +31,7 @@ jobs:
     outputs:
       version: ${{ steps.ver.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - id: ver
         shell: bash
         run: |
@@ -83,7 +83,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # ── Linux system deps ──────────────────────────────────────────────────
       - name: Install Linux system packages
@@ -184,51 +184,12 @@ jobs:
           test -f build/entry.dist/pianolotayu-gui.exe
           ls -lah build/entry.dist/ | head -40
 
-      # ── Zip ────────────────────────────────────────────────────────────────
-      - name: Create zip (Linux)
-        if: matrix.target_os == 'linux'
-        run: |
-          set -euxo pipefail
-          NAME="${ARTIFACT}"
-          mkdir -p "out/${NAME}"
-          if [[ ! -d build/entry.dist ]]; then
-            echo "missing build/entry.dist" >&2
-            ls -la build || true
-            exit 1
-          fi
-          cp -a build/entry.dist/. "out/${NAME}/"
-          rm -f "out/${NAME}"/nuitka-crash-report.xml || true
-          (
-            cd out
-            zip -r -9 "../${NAME}.zip" "${NAME}"
-          )
-          ls -lh "${NAME}.zip"
-
-      - name: Create zip (Windows)
-        if: matrix.target_os == 'windows'
-        shell: msys2 {0}
-        run: |
-          set -euxo pipefail
-          NAME="${ARTIFACT}"
-          mkdir -p "out/${NAME}"
-          if [[ ! -d build/entry.dist ]]; then
-            echo "missing build/entry.dist" >&2
-            ls -la build || true
-            exit 1
-          fi
-          cp -a build/entry.dist/. "out/${NAME}/"
-          rm -f "out/${NAME}"/nuitka-crash-report.xml || true
-          (
-            cd out
-            zip -r -9 "../${NAME}.zip" "${NAME}"
-          )
-          ls -lh "${NAME}.zip"
-
+      # ── Upload directory (artifact page already zips; don't double-zip) ───
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ env.ARTIFACT }}
-          path: ${{ env.ARTIFACT }}.zip
+          path: build/entry.dist
           if-no-files-found: error
           retention-days: 14
 
@@ -242,16 +203,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
 
-      - name: Flatten zips
+      - name: Package & flatten
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p release-assets
-          find artifacts -type f -name 'pianolotayu-*.zip' -print -exec cp -v {} release-assets/ \;
+          for dir in artifacts/*/; do
+            name="$(basename "$dir")"
+            echo "packaging ${name}.zip"
+            (cd "$dir" && zip -r -9 "../../release-assets/${name}.zip" .)
+          done
           ls -lah release-assets/
           test "$(ls -A release-assets)" || { echo "no zips produced"; exit 1; }
 
