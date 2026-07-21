@@ -1056,7 +1056,7 @@ def main() -> int:
             pass
 
     # Windows: own taskbar identity (must be before QApplication)
-    set_app_user_model_id("PianoLoTayu")
+    set_app_user_model_id("pianolotayu")
     # Windows: UIPI message filter so elevated process can receive Explorer drops
     prepare_elevated_drop_filters()
 

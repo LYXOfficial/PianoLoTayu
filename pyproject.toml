@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Convert audio files (MP3/WAV) to piano MIDI via Fourier Transform"
 readme = "README.md"
 authors = [
-    { name = "LYXOfficial", email = "lyx2010official@outlook.com" }
+    { name = "Ariasaka", email = "lyx2010official@outlook.com" }
 ]
 requires-python = ">=3.13"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
     "pretty-midi>=0.2.11",
     "pyfluidsynth>=1.4.0",
     "pyside6>=6.11.1",
+    "scipy>=1.18.0",
     "soundfile>=0.14.0",
     "soxr>=0.5.0",
 ]

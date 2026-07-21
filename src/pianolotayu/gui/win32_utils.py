@@ -269,7 +269,7 @@ def app_icon() -> QtGui.QIcon:
     return _app_icon_cache
 
 
-def set_app_user_model_id(app_id: str = "PianoLoTayu") -> None:
+def set_app_user_model_id(app_id: str = "pianolotayu") -> None:
     """Windows: group taskbar entries under our own AppUserModelID.
 
     Without this, a script launched via ``python.exe`` keeps the Python icon
@@ -279,6 +279,16 @@ def set_app_user_model_id(app_id: str = "PianoLoTayu") -> None:
         return
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except Exception:
+        pass
+    # Register a DisplayName so the toast notification shows "PianoLoTayu"
+    # instead of "python.exe" / "pianolotayu.exe".
+    try:
+        import winreg  # type: ignore[import-not-found]
+
+        key_path = "Software\\Classes\\AppUserModelId\\" + app_id
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "PianoLoTayu")
     except Exception:
         pass
 
