@@ -1,5 +1,6 @@
 # Build standalone GUI via `make package` for Linux / Windows.
-# Artifact: pianolotayu-{version}-{linux|windows}-{x64|x86|arm64}.zip
+# Artifact: pianolotayu-{version}-{linux|windows}-{x64|x86|arm64}.tar.gz
+# Release:  pianolotayu-{version}-{linux|windows}-{x64|x86|arm64}.zip
 #
 # Triggers: tag v*, manual dispatch (optional draft release).
 
@@ -184,13 +185,19 @@ jobs:
           test -f build/entry.dist/pianolotayu-gui.exe
           ls -lah build/entry.dist/ | head -40
 
-      # ── Upload directory (artifact page already zips; don't double-zip) ───
+      # ── Upload artifact ──────────────────────────────────────────────────────
+      - name: Tar artifact
+        run: |
+          set -euxo pipefail
+          (cd build && tar -czf "../${ARTIFACT}.tar.gz" entry.dist)
+
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: ${{ env.ARTIFACT }}
-          path: build/entry.dist
+          path: ${{ format('{0}.tar.gz', env.ARTIFACT) }}
           if-no-files-found: error
+          compression-level: 0
           retention-days: 14
 
   release:
@@ -218,10 +225,10 @@ jobs:
           for dir in artifacts/*/; do
             name="$(basename "$dir")"
             echo "packaging ${name}.zip"
-            (cd "$dir" && zip -r -9 "../../release-assets/${name}.zip" .)
+            (cd "$dir" && tar -xzf "${name}.tar.gz" && zip -r -9 "../../release-assets/${name}.zip" entry.dist)
           done
           ls -lah release-assets/
-          test "$(ls -A release-assets)" || { echo "no zips produced"; exit 1; }
+          test "$(ls -A release-assets)" || { echo "no assets produced"; exit 1; }
 
       - name: Package soundfonts
         shell: bash

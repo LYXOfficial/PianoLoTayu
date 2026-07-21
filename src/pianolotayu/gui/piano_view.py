@@ -988,28 +988,7 @@ class MidiPlayer(QtCore.QObject):
             if self._sfid < 0:
                 raise RuntimeError(f"SoundFont 加载失败：{sf_path}")
             self._assign_programs()
-            if sys.platform.startswith("linux"):
-                for driver in ("pipewire", "pulseaudio"):
-                    try:
-                        self._synth.start(driver=driver)
-                        break
-                    except Exception:
-                        continue
-                else:
-                    self._synth.start()
-            elif sys.platform == "win32":
-                for driver in ("wasapi", "dsound", "waveout"):
-                    try:
-                        self._synth.start(driver=driver)
-                        break
-                    except Exception:
-                        continue
-                else:
-                    self._synth.start()
-            elif sys.platform == "darwin":
-                self._synth.start(driver="coreaudio")
-            else:
-                self._synth.start()
+            self._synth.start()
             return True
         except Exception as exc:
             self.unload_soundfont()
