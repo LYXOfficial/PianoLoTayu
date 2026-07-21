@@ -1,5 +1,7 @@
 # Build standalone GUI via `make package` for Linux / Windows.
-# Artifact: pianolotayu-{version}-{linux|windows}-{x64|x86|arm64}.{tar.xz|zip}
+# Artifact: pianolotayu-{version}-{linux|windows}-{x64|x86|arm64}.tar.xz
+# Release:  pianolotayu-{version}-linux-{x64|arm64}.tar.xz
+#           pianolotayu-{version}-windows-{x64}.zip
 #
 # Triggers: tag v*, manual dispatch (optional draft release).
 
@@ -99,7 +101,6 @@ jobs:
             curl \
             zip \
             unzip \
-            xz-utils \
             upx-ucl \
             fluidsynth \
             libfluidsynth3 \
@@ -186,8 +187,7 @@ jobs:
           ls -lah build/entry.dist/ | head -40
 
       # ── Upload artifact ──────────────────────────────────────────────────────
-      - name: Tar Linux artifact (preserve +x)
-        if: matrix.target_os == 'linux'
+      - name: Tar artifact
         run: |
           set -euxo pipefail
           (cd build && tar -cJf "../${ARTIFACT}.tar.xz" entry.dist)
@@ -196,10 +196,10 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: ${{ env.ARTIFACT }}
-          path: ${{ matrix.target_os == 'linux' && format('{0}.tar.xz', env.ARTIFACT) || 'build/entry.dist' }}
+          path: ${{ format('{0}.tar.xz', env.ARTIFACT) }}
           if-no-files-found: error
+          compression-level: 0
           retention-days: 14
-          archive: false
 
   release:
     needs: [meta, build]
@@ -227,13 +227,12 @@ jobs:
             name="$(basename "$dir")"
             case "$name" in
               *linux*)
-                # Linux artifact is already a tar.xz — just move it
                 echo "moving ${name}.tar.xz"
                 mv "${dir}/${name}.tar.xz" "release-assets/${name}.tar.xz"
                 ;;
               *)
                 echo "packaging ${name}.zip"
-                mv "${dir}/${name}.zip" "release-assets/${name}.zip"
+                (cd "$dir" && tar -xJf "${name}.tar.xz" && zip -r -9 "../../release-assets/${name}.zip" entry.dist)
                 ;;
             esac
           done
