@@ -190,7 +190,7 @@ jobs:
       - name: Tar artifact
         run: |
           set -euxo pipefail
-          (cd build && tar -cJf "../${ARTIFACT}.tar.xz" entry.dist)
+          (cd build/entry.dist && tar -cJf "../../${ARTIFACT}.tar.xz" .)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
@@ -232,7 +232,7 @@ jobs:
                 ;;
               *)
                 echo "packaging ${name}.zip"
-                (cd "$dir" && tar -xJf "${name}.tar.xz" && zip -r -9 "../../release-assets/${name}.zip" entry.dist)
+                (cd "$dir" && tar -xJf "${name}.tar.xz" && rm "${name}.tar.xz" && zip -r -9 "../../release-assets/${name}.zip" .)
                 ;;
             esac
           done
