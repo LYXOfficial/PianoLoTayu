@@ -1,5 +1,5 @@
 """Shared defaults — single source of truth for both CLI and GUI."""
-VERSION = "v0.1.0"
+VERSION = "v1.0.0"
 
 DEFAULTS = {
     "sr": 22050,

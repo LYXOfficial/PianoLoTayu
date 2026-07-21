@@ -1,6 +1,6 @@
 [project]
 name = "pianolotayu"
-version = "0.1.0"
+version = "1.0.0"
 description = "Convert audio files (MP3/WAV) to piano MIDI via Fourier Transform"
 readme = "README.md"
 authors = [
