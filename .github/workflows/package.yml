@@ -164,10 +164,6 @@ jobs:
           uv --version
           make package
           test -x build/entry.dist/pianolotayu-gui
-          printf '%s\n' \
-            "Linux build: install fluidsynth from your distro if audio export fails." \
-            "  e.g. sudo apt install fluidsynth libfluidsynth3" \
-            > build/entry.dist/README-linux.txt
 
       - name: make package (Windows / MSYS2)
         if: matrix.target_os == 'windows'
