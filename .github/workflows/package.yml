@@ -1,6 +1,6 @@
 # Build standalone GUI via `make package` for Linux / Windows.
-# Artifact: pianolotayu-{version}-{linux|windows}-{x64|x86|arm64}.tar.gz
-# Release:  pianolotayu-{version}-{linux|windows}-{x64|x86|arm64}.zip
+# Artifact: pianolotayu-{version}-{linux|windows}-{x64|x86|arm64}.tar.xz
+# Release:  linux → .tar.xz, windows → .zip
 #
 # Triggers: tag v*, manual dispatch (optional draft release).
 
@@ -189,13 +189,13 @@ jobs:
       - name: Tar artifact
         run: |
           set -euxo pipefail
-          (cd build && tar -czf "../${ARTIFACT}.tar.gz" entry.dist)
+          (cd build && tar -cJf "../${ARTIFACT}.tar.xz" entry.dist)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: ${{ env.ARTIFACT }}
-          path: ${{ format('{0}.tar.gz', env.ARTIFACT) }}
+          path: ${{ format('{0}.tar.xz', env.ARTIFACT) }}
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
@@ -224,8 +224,16 @@ jobs:
           mkdir -p release-assets
           for dir in artifacts/*/; do
             name="$(basename "$dir")"
-            echo "packaging ${name}.zip"
-            (cd "$dir" && tar -xzf "${name}.tar.gz" && zip -r -9 "../../release-assets/${name}.zip" entry.dist)
+            case "$name" in
+              *linux*)
+                echo "moving ${name}.tar.xz"
+                mv "${dir}/${name}.tar.xz" "release-assets/${name}.tar.xz"
+                ;;
+              *)
+                echo "packaging ${name}.zip"
+                (cd "$dir" && tar -xJf "${name}.tar.xz" && zip -r -9 "../../release-assets/${name}.zip" entry.dist)
+                ;;
+            esac
           done
           ls -lah release-assets/
           test "$(ls -A release-assets)" || { echo "no assets produced"; exit 1; }
