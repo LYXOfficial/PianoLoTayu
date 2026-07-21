@@ -207,6 +207,9 @@ jobs:
         with:
           path: artifacts
 
+      - name: Checkout
+        uses: actions/checkout@v5
+
       - name: Package & flatten
         shell: bash
         run: |
