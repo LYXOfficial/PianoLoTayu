@@ -180,6 +180,8 @@ sudo pacman -S upx
 make package
 ```
 
+Windows 打包时会自动下载 `upx` 用于给 `nuitka` 压缩，同时下载 `fluidsynth` 丢进二进制产物里面，且 `nuitka` 会下载 `zig` 作为编译工具，所以请自行保持良好的外网访问性。
+
 打包后的可执行文件位于 `build/entry.dist/` 目录下。
 
 ---

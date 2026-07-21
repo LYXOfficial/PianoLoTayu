@@ -220,6 +220,18 @@ jobs:
           ls -lah release-assets/
           test "$(ls -A release-assets)" || { echo "no zips produced"; exit 1; }
 
+      - name: Package soundfonts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Checkout soundfonts branch and zip its contents
+          git fetch origin soundfonts
+          git checkout origin/soundfonts
+          zip -r -9 release-assets/soundfonts.zip soundfonts/ -x "*.git*"
+          ls -lah release-assets/soundfonts.zip
+          # Switch back to original branch for release step
+          git checkout -
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
