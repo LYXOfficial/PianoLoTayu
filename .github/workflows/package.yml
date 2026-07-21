@@ -145,17 +145,6 @@ jobs:
           update: true
           install: make tar curl zip unzip git
 
-      - name: Verify MSYS2 tools
-        if: matrix.target_os == 'windows'
-        shell: msys2 {0}
-        run: |
-          set -euxo pipefail
-          make --version
-          command -v make
-          command -v curl
-          command -v tar
-          command -v zip
-
       # ── Build ──────────────────────────────────────────────────────────────
       - name: make package (Linux)
         if: matrix.target_os == 'linux'
