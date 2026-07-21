@@ -1,8 +1,15 @@
-# PianoLoTayu 
+<div align="center">
+<img src="https://raw.githubusercontent.com/LYXOfficial/PianoLoTayu/refs/heads/master/icon.ico"/>
+<h1>PianoLoTayu</h1>
+</div>
 
 特别感谢 Deepseek V4 / Grok 4.5 / Kimi K2.6 / GPT 5.5 / Claude Code 的鼎力相助！（
 
 在看一些特异视频的时候，经常看到有人把各种神秘歌曲转成钢琴唱歌的形式，乍一听是一坨噪音，不过如果听过原曲就能脑补出人声，不过感觉转换和瀑布预览都没有什么好用的工具，所以自己写了一个（
+
+至于名字来源就是某台湾特异人士的名字了，图标是QQExcel的神秘截图
+
+导出效果预览：https://www.bilibili.com/video/BV1fWKC6TE2e
 
 ---
 
@@ -146,6 +153,8 @@ uv run python -m pianolotayu.cli song.mp3 \
 
 若无 SoundFont（见上文）时预览与导出音视频只能是静音的，当 soundfonts 文件夹中有可用的 soundfont 则会自动选择，这时就能听到音色了。
 
+另外按空格可以切换播放/暂停，Ctrl+滚轮可以缩放钢琴卷帘区，双击可以进出全屏，或者按 Esc 退出全屏
+
 导出音视频提供了丰富的编码与码率选项（见上文），功能依赖 FFmpeg 与 FluidSynth，请确保按照前文安装好依赖。
 
 ---
@@ -185,6 +194,25 @@ Windows 打包时会自动下载 `upx` 用于给 `nuitka` 压缩，同时下载 
 打包后的可执行文件位于 `build/entry.dist/` 目录下。
 
 ---
+
+## Preview
+
+<div align="center">
+<img width="2560" height="1440" alt="image" src="https://github.com/user-attachments/assets/0f857ed3-4e3f-4695-bdb6-f51a130412dc" />
+<br/>
+<img width="2068" height="1044" alt="image" src="https://github.com/user-attachments/assets/ae89b4df-4955-4122-b156-cda2fdabb704" />
+<br/>
+<img width="291" height="334" alt="image" src="https://github.com/user-attachments/assets/ffc70d41-a651-4c4b-a6cc-7df2cf0d3db3" />
+<br/>
+<img width="346" height="309" alt="image" src="https://github.com/user-attachments/assets/109decfb-4dbe-4c0c-8cef-7e4e64afd8d4" />
+<br/>
+<img width="383" height="490" alt="image" src="https://github.com/user-attachments/assets/e707b555-91af-4c79-bea4-795bafb9f1a4" />
+<br/>
+<img width="1713" height="930" alt="image" src="https://github.com/user-attachments/assets/203af71d-f20a-450c-becb-e93e20c825b5" />
+</div>
+
+---
+
 
 ## 许可证
 
