@@ -202,13 +202,13 @@ jobs:
        inputs.create_release == true)
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
       - name: Download all artifacts
         uses: actions/download-artifact@v5
         with:
           path: artifacts
-
-      - name: Checkout
-        uses: actions/checkout@v5
 
       - name: Package & flatten
         shell: bash
